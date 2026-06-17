@@ -1,0 +1,147 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pocketledger
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: pocketledger
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pocketledger"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    networks:
+      - internal
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    networks:
+      - internal
+
+  wallet-svc:
+    build:
+      context: ..
+      dockerfile: services/wallet-svc/Dockerfile
+    environment:
+      # Server TLS (wallet-svc listens on :8081)
+      - TLS_CERT_FILE=/certs/wallet-svc.crt
+      - TLS_KEY_FILE=/certs/wallet-svc.key
+      - TLS_CA_FILE=/certs/ca.crt
+      # Outbound mTLS client cert for calls TO ledger-svc
+      # Previously reused wallet-svc.crt — now uses dedicated wallet-client cert
+      - LEDGER_SVC_CLIENT_CERT_FILE=/certs/wallet-client.crt
+      - LEDGER_SVC_CLIENT_KEY_FILE=/certs/wallet-client.key
+      - LEDGER_SVC_CA_FILE=/certs/ca.crt
+      - BANK_WALLET_ID=bank-main
+      - LEDGER_SVC_URL=https://ledger-svc:8082
+    volumes:
+      - ./certs:/certs:ro
+      - wallet-data:/data
+      - ../migrations:/migrations
+    networks:
+      - internal
+
+  ledger-svc:
+    build:
+      context: ..
+      dockerfile: services/ledger-svc/Dockerfile
+    environment:
+      # Server TLS (ledger-svc listens on :8082)
+      - TLS_CERT_FILE=/certs/ledger-svc.crt
+      - TLS_KEY_FILE=/certs/ledger-svc.key
+      - TLS_CA_FILE=/certs/ca.crt
+      # Outbound mTLS client cert for calls TO wallet-svc
+      # Previously used ledger-client.crt — kept as-is, correctly split
+      - LEDGER_SVC_CLIENT_CERT_FILE=/certs/ledger-client.crt
+      - LEDGER_SVC_CLIENT_KEY_FILE=/certs/ledger-client.key
+      - LEDGER_SVC_CA_FILE=/certs/ca.crt
+      - POLICY_CONFIG_PATH=/etc/ledger/policy.yaml
+      - BANK_WALLET_ID=bank-main
+      - WALLET_SVC_URL=https://wallet-svc:8081
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=pocketledger
+      - PG_PASSWORD=${PG_PASSWORD}
+      - PG_DB=pocketledger
+      - REDIS_ADDR=redis:6379
+      - WEBHOOK_URL=http://mock-webhook-receiver:8080/webhook
+    volumes:
+      - ledger-data:/data
+      - ../migrations:/migrations
+      - ./certs:/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    networks:
+      - internal
+    environment:
+      - VITE_BANKDB=bank-main
+
+  gateway:
+    image: nginx:1.25-alpine
+    container_name: pl-gateway
+    ports:
+      - "8080:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/certs:ro
+    depends_on:
+      - wallet-svc
+      - ledger-svc
+    networks:
+      - internal
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  wallet-data:
+  ledger-data:
+
+networks:
+  internal:

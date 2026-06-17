@@ -1,0 +1,7 @@
+go 1.25.0
+
+use (
+	./services/ledger-svc
+	./services/wallet-svc
+	./shared/domain
+)

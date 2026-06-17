@@ -1,0 +1,82 @@
+# Binaries and build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/ledger-svc
+/wallet-svc
+/frontend/di
+/services/*/ledger-svc
+/services/*/wallet-svc
+
+# Dependency directories
+node_modules/
+vendor/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Database files (local development)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/data/
+/ledger.db
+/wallet.db
+
+# Logs
+*.log
+logs/
+
+# Environment files (contains secrets)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Certificates and keys (sensitive)
+infra/certs/*.key
+infra/certs/*.crt
+infra/certs/*.pem
+infra/certs/*.csr
+infra/certs/*.srl
+infra/certs/nginx-client.*
+!infra/certs/README.md   # optional placeholder
+
+# Migration files backups
+*.backup
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker volumes (optional, if you store volume data locally)
+volumes/
+postgres-data/
+ledger-data/
+wallet-data/
+prometheus-data/
+
+# Grafana data (if added later)
+grafana-data/
+
+# Load testing outputs
+results/
+*.html
+*.json
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

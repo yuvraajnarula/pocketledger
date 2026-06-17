@@ -1,0 +1,19 @@
+image: gitpod/workspace-full
+tasks:
+  - name: Setup & Run
+    init: go work sync && go mod tidy
+    command: >
+      go run ./services/wallet-svc/cmd/main.go &
+      go run ./services/ledger-svc/cmd/main.go &
+      cd dashboard && python3 -m http.server 3000 &
+      echo "Dashboard: $(gp url 3000)"
+ports:
+  - port: 3000
+    onOpen: open-preview
+  - port: 8081
+    onOpen: ignore
+  - port: 8082
+    onOpen: ignore
+vscode:
+  extensions:
+    - golang.go

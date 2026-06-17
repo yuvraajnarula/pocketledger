@@ -1,0 +1,16 @@
+max_withdrawal_per_day: 10000      
+min_transfer_amount: 1             
+require_memo_above: 5000           
+enable_fx_fees: true               
+
+rate_limits:
+  default:
+    requests_per_second: 10
+    burst: 20
+  per_wallet:
+    "bank-main":
+      requests_per_second: 100
+      burst: 200
+    "vip_wallet_123":
+      requests_per_second: 50
+      burst: 100
