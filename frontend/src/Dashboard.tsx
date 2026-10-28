@@ -230,7 +230,6 @@ const styles = {
     display: "inline-block",
     marginRight: 6,
   }),
-  // New styles for idempotency table and advanced grid
   idemTable: {
     maxHeight: 200,
     overflowY: "auto",
@@ -311,21 +310,16 @@ export default function Dashboard() {
   const [transferAmount, setTransferAmount] = useState("500");
   const [idemKey, setIdemKey] = useState("");
 
-  // Time-Travel Debugger state
   const [ttWalletId, setTtWalletId] = useState("");
   const [ttTimestamp, setTtTimestamp] = useState("");
   const [ttResult, setTtResult] = useState("");
 
-  // Idempotency Explorer state
   const [idemKeys, setIdemKeys] = useState([]);
-
-  // Chaos Mode state
   const [chaosEnabled, setChaosEnabled] = useState(false);
 
-  // Advanced Features state
   const [fxSrc, setFxSrc] = useState("");
   const [fxDest, setFxDest] = useState("");
-  const [fxCurrency, setFxCurrency] = useState("INR");
+  const [fxCurrency, setFxCurrency] = useState("USD");
   const [fxAmount, setFxAmount] = useState("");
   const [disputeRef, setDisputeRef] = useState("");
   const [proofWalletId, setProofWalletId] = useState("");
@@ -410,7 +404,6 @@ export default function Dashboard() {
     return () => clearInterval(t);
   }, [checkHealth]);
 
-  // --- Time-Travel ---
   const fetchHistoricalBalance = useCallback(async () => {
     if (!ttWalletId || !ttTimestamp) {
       addLog("Missing wallet ID or timestamp", "error");
@@ -427,7 +420,6 @@ export default function Dashboard() {
     }
   }, [ttWalletId, ttTimestamp, apiCall]);
 
-  // --- Idempotency Explorer ---
   const loadIdemKeys = useCallback(async () => {
     const res = await apiCall(`${LEDGER_SVC}/idempotency/keys?limit=20`, "GET");
     if (res.ok && res.data) {
@@ -438,29 +430,29 @@ export default function Dashboard() {
     }
   }, [apiCall, addLog]);
 
+  // FIX 1: sync chaosEnabled from the backend response, not from the
+  // optimistic local newState. If the server rejects the toggle for any
+  // reason the UI won't drift out of sync.
   const toggleChaos = useCallback(async () => {
     const newState = !chaosEnabled;
-
     const res = await apiCall(
       `${LEDGER_SVC}/admin/chaos`,
       "POST",
       { enabled: newState },
       `chaos-${Date.now()}`,
     );
-
     if (res.ok) {
-      setChaosEnabled(newState);
-
-    addLog(
-      `Chaos mode ${newState ? "ENABLED" : "DISABLED"}`,
-      newState ? "warning" : "info",
-    );  
-  } else {
+      const confirmed = res.data?.enabled ?? newState;
+      setChaosEnabled(confirmed);
+      addLog(
+        `Chaos mode ${confirmed ? "ENABLED" : "DISABLED"}`,
+        confirmed ? "warning" : "info",
+      );
+    } else {
       addLog("Failed to toggle chaos mode", "error");
     }
   }, [chaosEnabled, apiCall, addLog]);
 
-  // --- Advanced Features ---
   const runFXTransfer = useCallback(async () => {
     if (!fxSrc || !fxDest || !fxAmount) {
       addLog("Missing FX transfer details", "error");
@@ -471,8 +463,6 @@ export default function Dashboard() {
       addLog("Invalid amount", "error");
       return;
     }
-    const idempotencyKey = crypto.randomUUID();
-
     const res = await apiCall(
       `${LEDGER_SVC}/wallets/${fxSrc}/transfer/fx`,
       "POST",
@@ -482,7 +472,7 @@ export default function Dashboard() {
         amount: amt,
         memo: "fx-conversion",
       },
-      idempotencyKey
+      crypto.randomUUID(),
     );
     if (res.ok) addLog("FX transfer completed", "success");
   }, [fxSrc, fxDest, fxCurrency, fxAmount, apiCall, addLog]);
@@ -492,7 +482,6 @@ export default function Dashboard() {
       addLog("Missing transaction reference ID", "error");
       return;
     }
-    // Using the global srcId from wallet service as the wallet_id for dispute
     if (!srcId) {
       addLog(
         "Please provide a source wallet ID (from Wallet Service section)",
@@ -569,13 +558,13 @@ export default function Dashboard() {
   };
 
   const deposit = async () => {
-  if (!walletId || !amount) {
-    addLog("Missing wallet ID or amount", "error");
-    return;
-  }
-  const idempotencyKey = `deposit-${Date.now()}-${Math.random()}`;
-  const BANK_WALLET_ID = `${import.meta.env.VITE_BANKDB}`;
-  const res = await apiCall(
+    if (!walletId || !amount) {
+      addLog("Missing wallet ID or amount", "error");
+      return;
+    }
+    const idempotencyKey = `deposit-${Date.now()}-${Math.random()}`;
+    const BANK_WALLET_ID = `${import.meta.env.VITE_BANKDB}`;
+    const res = await apiCall(
       `${LEDGER_SVC}/wallets/${BANK_WALLET_ID}/transfer`,
       "POST",
       {
@@ -584,7 +573,7 @@ export default function Dashboard() {
         reference_id: `deposit-${Date.now()}`,
         memo: "Customer deposit",
       },
-      idempotencyKey
+      idempotencyKey,
     );
     if (!res.ok) {
       addLog(`Deposit failed: ${res.data?.error || "unknown error"}`, "error");
@@ -620,13 +609,16 @@ export default function Dashboard() {
     );
   };
 
+  // FIX 2: backend returns `diff`, not `discrepancy_paise`. The old code
+  // always evaluated `undefined !== 0` as true, so the log was always
+  // "warning" even when the ledger was balanced.
   const reconcile = async () => {
     const res = await apiCall(`${LEDGER_SVC}/reconcile`, "GET");
     if (res.ok && res.data) {
-      const { status, discrepancy_paise } = res.data;
+      const { status, diff } = res.data;
       addLog(
-        `Reconcile: ${status?.toUpperCase()} ${discrepancy_paise !== 0 ? `Diff: ${discrepancy_paise}` : ""}`,
-        discrepancy_paise === 0 ? "success" : "warning",
+        `Reconcile: ${status?.toUpperCase()}${diff !== 0 ? ` — Diff: ${diff}` : ""}`,
+        diff === 0 ? "success" : "warning",
         res.data,
       );
     }
@@ -875,7 +867,7 @@ export default function Dashboard() {
           </div>
         </header>
 
-        {/* Wallet & Ledger Operations (existing) */}
+        {/* Wallet & Ledger Operations */}
         <div style={styles.grid}>
           <div style={styles.card}>
             <div style={styles.cardTitle}>Wallet Service</div>
@@ -998,7 +990,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Time-Travel Debugger Card */}
+        {/* Time-Travel Debugger */}
         <div style={styles.card}>
           <div style={styles.cardTitle}>Time-Travel Debugger</div>
           <div style={styles.row}>
@@ -1021,10 +1013,10 @@ export default function Dashboard() {
           <div style={{ marginTop: "0.5rem", fontWeight: 600 }}>{ttResult}</div>
         </div>
 
-        {/* Idempotency Explorer Card */}
+        {/* Idempotency Explorer */}
         <div style={styles.card}>
           <div style={styles.cardTitle}>Idempotency Explorer</div>
-          <Btn onClick={loadIdemKeys} variant="secondary">
+          <Btn onClick={loadIdemKeys} variant="ghost">
             Refresh Keys
           </Btn>
           <div style={styles.idemTable}>
@@ -1047,7 +1039,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Chaos Mode Card */}
+        {/* Chaos Engineering */}
         <div style={styles.card}>
           <div style={styles.cardTitle}>Chaos Engineering</div>
           <div style={styles.row}>
@@ -1065,7 +1057,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Advanced Features Card */}
+        {/* Advanced Features */}
         <div style={styles.card}>
           <div style={styles.cardTitle}>Advanced Features</div>
           <div style={styles.advancedSubGrid}>
@@ -1085,6 +1077,8 @@ export default function Dashboard() {
                   onChange={(e) => setFxDest(e.target.value)}
                   style={{ marginBottom: "0.3rem" }}
                 />
+                {/* FIX 3: was value="INR" for the USD option — every FX call
+                    was silently sending target_currency: "INR" */}
                 <select
                   value={fxCurrency}
                   onChange={(e) => setFxCurrency(e.target.value)}
@@ -1094,7 +1088,7 @@ export default function Dashboard() {
                     width: "100%",
                   }}
                 >
-                  <option value="INR">USD </option>
+                  <option value="USD">USD</option>
                   <option value="EUR">EUR</option>
                 </select>
                 <Input
@@ -1144,10 +1138,10 @@ export default function Dashboard() {
                   gap: "0.5rem",
                 }}
               >
-                <Btn onClick={loadWebhooks} variant="secondary">
+                <Btn onClick={loadWebhooks} variant="ghost">
                   View Webhooks
                 </Btn>
-                <Btn onClick={downloadPostmortem} variant="secondary">
+                <Btn onClick={downloadPostmortem} variant="ghost">
                   Download Post‑Mortem
                 </Btn>
               </div>
