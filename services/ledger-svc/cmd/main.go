@@ -195,7 +195,7 @@ func main() {
 	mux := http.NewServeMux()
 	handler.Register(mux)
 
-	finalHandler := internal.ChaosMiddleware(chaos)(idemMiddleware.Handle(mux))
+	finalHandler := internal.AuthMiddleware(internal.ChaosMiddleware(chaos)(idemMiddleware.Handle(mux)))
 
 	// ── Webhook worker ───────────────────────────────────────────────────────
 	webhookCfg := internal.WebhookWorkerConfig{
