@@ -5,13 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-	"fmt"
+
 	_ "github.com/lib/pq"
 
 	"github.com/yuvraajnarula/pocketledger/services/ledger-svc/internal"
@@ -23,7 +24,12 @@ const (
 )
 
 func main() {
-	// PostgreSQL connection
+	// ── Chaos controller ────────────────────────────────────────────────────
+	// Created once here so the same pointer goes to both NewHandler (for the
+	// /admin/chaos toggle) and ChaosMiddleware (which reads the atomic flag).
+	chaos := internal.NewChaosController()
+
+	// ── PostgreSQL ───────────────────────────────────────────────────────────
 	pgHost := os.Getenv("PG_HOST")
 	pgPort := os.Getenv("PG_PORT")
 	pgUser := os.Getenv("PG_USER")
@@ -56,7 +62,7 @@ func main() {
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(10)
 
-	// Run schema migrations (idempotent)
+	// ── Schema migrations ────────────────────────────────────────────────────
 	schema := `
 	CREATE TABLE IF NOT EXISTS wallets (
 		id TEXT PRIMARY KEY,
@@ -117,10 +123,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Ensure bank wallet exists
+	// ── Bank wallet ──────────────────────────────────────────────────────────
 	var exists bool
-	err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM wallets WHERE id = $1)", bankWalletID).Scan(&exists)
-	if err != nil {
+	if err = db.QueryRow("SELECT EXISTS(SELECT 1 FROM wallets WHERE id = $1)", bankWalletID).Scan(&exists); err != nil {
 		slog.Error("check bank wallet", "error", err)
 		os.Exit(1)
 	}
@@ -135,20 +140,16 @@ func main() {
 		}
 		slog.Info("created bank wallet", "id", bankWalletID, "balance", initialBankBalance)
 	} else {
-		// Reset balance on restart
-		_, err = db.Exec("UPDATE wallets SET balance = $1 WHERE id = $2", initialBankBalance, bankWalletID)
-		if err != nil {
+		if _, err = db.Exec("UPDATE wallets SET balance = $1 WHERE id = $2", initialBankBalance, bankWalletID); err != nil {
 			slog.Error("reset bank balance", "error", err)
 		} else {
 			slog.Info("reset bank wallet balance", "id", bankWalletID, "balance", initialBankBalance)
 		}
 	}
 
-	// ========== LOAD POLICY CONFIGURATION ==========
+	// ── Policy & rate limiter ────────────────────────────────────────────────
 	policyPath := os.Getenv("POLICY_CONFIG_PATH")
 	if policyPath == "" {
-		// Default location: infra/policy.yaml relative to working directory
-		// Adjust this to match your Dockerfile COPY command.
 		policyPath = "./infra/policy.yaml"
 	}
 	policyCfg, err := internal.LoadPolicy(policyPath)
@@ -160,15 +161,18 @@ func main() {
 
 	rateLimiter := internal.NewLocalRateLimiter(policyCfg)
 
-	handler := internal.NewHandler(db, rateLimiter)
+	// ── Handler & metrics ────────────────────────────────────────────────────
+	// Pass chaos so handler.ToggleChaos and ChaosMiddleware share the same
+	// atomic flag — no coordination needed.
+	handler := internal.NewHandler(db, rateLimiter, chaos)
+
 	metrics := internal.NewMetrics()
 	metrics.SetDBQuery(func() (int64, int64, error) {
 		var wallets, entries int64
-		err := db.QueryRow("SELECT COUNT(*) FROM wallets").Scan(&wallets)
-		if err != nil {
+		if err := db.QueryRow("SELECT COUNT(*) FROM wallets").Scan(&wallets); err != nil {
 			return 0, 0, err
 		}
-		err = db.QueryRow("SELECT COUNT(*) FROM ledger_entries").Scan(&entries)
+		err := db.QueryRow("SELECT COUNT(*) FROM ledger_entries").Scan(&entries)
 		return wallets, entries, err
 	})
 	handler.SetMetrics(metrics)
@@ -178,17 +182,24 @@ func main() {
 		go reconciler.Run(context.Background())
 	}
 
+	// ── Middleware chain ─────────────────────────────────────────────────────
+	//
+	//   Request → ChaosMiddleware → IdempotencyMiddleware → mux
+	//
+	// Chaos is outermost so it can short-circuit before idempotency writes
+	// anything to the DB. /health, /admin/chaos, and /metrics are exempt
+	// inside ChaosMiddleware so the toggle itself is never chaos'd.
 	idemStore := internal.NewIdempotencyStore(db)
 	idemMiddleware := internal.NewIdempotencyMiddleware(idemStore)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)
-	protected := idemMiddleware.Handle(mux)
 
-	// --- Webhook Worker ---
-	webhookURL := os.Getenv("WEBHOOK_URL")
+	finalHandler := internal.ChaosMiddleware(chaos)(idemMiddleware.Handle(mux))
+
+	// ── Webhook worker ───────────────────────────────────────────────────────
 	webhookCfg := internal.WebhookWorkerConfig{
-		WebhookURL:   webhookURL,
+		WebhookURL:   os.Getenv("WEBHOOK_URL"),
 		EventURLs:    map[string]string{},
 		MaxRetries:   5,
 		PollInterval: 5 * time.Second,
@@ -197,7 +208,7 @@ func main() {
 	webhookWorker.Start()
 	defer webhookWorker.Stop()
 
-	// --- TLS/mTLS Configuration ---
+	// ── TLS / mTLS ───────────────────────────────────────────────────────────
 	certFile := os.Getenv("TLS_CERT_FILE")
 	keyFile := os.Getenv("TLS_KEY_FILE")
 	caCertFile := os.Getenv("TLS_CA_FILE")
@@ -212,26 +223,25 @@ func main() {
 		caCertPool := x509.NewCertPool()
 		caCertPool.AppendCertsFromPEM(caCert)
 
-		tlsConfig := &tls.Config{
-			ClientAuth: tls.RequireAndVerifyClientCert,
-			ClientCAs:  caCertPool,
-			MinVersion: tls.VersionTLS12,
-		}
 		srv = &http.Server{
-			Addr:      ":8082",
-			Handler:   protected,
-			TLSConfig: tlsConfig,
+			Addr:    ":8082",
+			Handler: finalHandler,
+			TLSConfig: &tls.Config{
+				ClientAuth: tls.RequireAndVerifyClientCert,
+				ClientCAs:  caCertPool,
+				MinVersion: tls.VersionTLS12,
+			},
 		}
 		slog.Info("ledger-svc starting with mTLS", "addr", ":8082")
 	} else {
 		srv = &http.Server{
 			Addr:    ":8082",
-			Handler: protected,
+			Handler: finalHandler,
 		}
 		slog.Info("ledger-svc starting (plain HTTP)", "addr", ":8082")
 	}
 
-	// Graceful shutdown
+	// ── Serve ────────────────────────────────────────────────────────────────
 	go func() {
 		if certFile != "" && keyFile != "" && caCertFile != "" {
 			if err := srv.ListenAndServeTLS(certFile, keyFile); err != nil && err != http.ErrServerClosed {
