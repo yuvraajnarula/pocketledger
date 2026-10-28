@@ -8,7 +8,6 @@ import (
 	"time"
 )
 
-
 type ChaosConfig struct {
 	FailureProbability float64 // fraction of non-admin requests to hard-fail
 	MinLatencyMs       int     // always injected when chaos is on
@@ -31,16 +30,15 @@ func NewChaosController() *ChaosController {
 	}
 }
 
-func (c *ChaosController) Enable()     { c.enabled.Store(true) }
-func (c *ChaosController) Disable()    { c.enabled.Store(false) }
+func (c *ChaosController) Enable()         { c.enabled.Store(true) }
+func (c *ChaosController) Disable()        { c.enabled.Store(false) }
 func (c *ChaosController) IsEnabled() bool { return c.enabled.Load() }
-
 
 func ChaosMiddleware(ctrl *ChaosController) func(http.Handler) http.Handler {
 	exempt := map[string]bool{
-		"/health":        true,
-		"/admin/chaos":   true,
-		"/metrics":       true,
+		"/health":      true,
+		"/admin/chaos": true,
+		"/metrics":     true,
 	}
 
 	return func(next http.Handler) http.Handler {

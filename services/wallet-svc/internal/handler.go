@@ -16,12 +16,14 @@ import (
 )
 
 type Handler struct {
-	db      *sql.DB
-	metrics *Metrics
+	db         *sql.DB
+	metrics    *Metrics
 	httpClient *http.Client
+	authStore  *APIKeyStore
 }
-func NewHandler(db *sql.DB, httpClient *http.Client) *Handler {
-    return &Handler{db: db, httpClient: httpClient}
+
+func NewHandler(db *sql.DB, httpClient *http.Client, authStore *APIKeyStore) *Handler {
+	return &Handler{db: db, httpClient: httpClient, authStore: authStore}
 }
 
 func (h *Handler) SetMetrics(m *Metrics) {
@@ -31,7 +33,7 @@ func (h *Handler) SetMetrics(m *Metrics) {
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /wallets", h.CreateWallet)
 	mux.HandleFunc("GET /wallets/{id}", h.GetWallet)
-	mux.HandleFunc("POST /wallets/{id}/deposit", h.Deposit)   // proxy to ledger-svc
+	mux.HandleFunc("POST /wallets/{id}/deposit", h.Deposit) // proxy to ledger-svc
 	mux.HandleFunc("POST /wallets/{id}/withdraw", h.Withdraw)
 	mux.HandleFunc("POST /internal/wallets/{id}/credit", h.Credit) // called by ledger-svc
 }
@@ -254,12 +256,23 @@ func (h *Handler) Credit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now := time.Now().UTC()
+	expiresAt := now.Add(24 * time.Hour)
+	responseBodyJSON := `{"status":"credited"}`
+
 	// Record idempotency key
 	_, err = tx.ExecContext(r.Context(),
 		`INSERT INTO idempotency_keys (key, status, request_hash, response_code, response_body, created_at, expires_at)
-		 VALUES (?, 'completed', ?, 200, '{"status":"credited"}', ?, ?)`,
-		req.RefID, req.RefID, time.Now().UTC(), time.Now().Add(24*time.Hour),
+		 VALUES (?, 'completed', ?, 200, ?, ?, ?)`,
+		req.RefID, req.RefID, responseBodyJSON, now, expiresAt,
 	)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	var balance int64
+	err = tx.QueryRowContext(r.Context(), `SELECT balance FROM wallets WHERE id = ?`, id).Scan(&balance)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -276,23 +289,11 @@ func (h *Handler) Credit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Optional: insert a local ledger entry for audit (mirrors ledger-svc)
-	_, err = tx.ExecContext(r.Context(),
-		`INSERT INTO ledger_entries (id, wallet_id, entry_type, amount, reference_id, created_at)
-		 VALUES (?, ?, 'CREDIT', ?, ?, ?)`,
-		uuid.New().String(), id, req.Amount, req.RefID, time.Now().UTC(),
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "credited"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "credited", "balance": balance})
 }
 
 func (h *Handler) Withdraw(w http.ResponseWriter, r *http.Request) {
@@ -351,12 +352,17 @@ func (h *Handler) Withdraw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var balance int64
+	err = tx.QueryRowContext(r.Context(), `SELECT balance FROM wallets WHERE id = ?`, id).Scan(&balance)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "withdrawn"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "withdrawn", "balance": balance})
 }
 
 func insertLedgerEntries(ctx context.Context, tx *sql.Tx, entries []domain.LedgerEntry) error {
@@ -387,6 +393,46 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds": time.Since(startTime).Seconds(),
 		"database":       "sqlite_wal",
 		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
+	type probe struct {
+		Name string `json:"name"`
+		OK   bool   `json:"ok"`
+		Err  string `json:"error,omitempty"`
+	}
+	probes := []probe{
+		{
+			Name: "database",
+			OK:   true,
+		},
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.db.PingContext(ctx); err != nil {
+		probes[0].OK = false
+		probes[0].Err = err.Error()
+	}
+
+	allOK := true
+	for _, p := range probes {
+		if !p.OK {
+			allOK = false
+			break
+		}
+	}
+
+	status := http.StatusOK
+	if !allOK {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  allOK,
+		"probes":  probes,
+		"version": "0.1.0",
 	})
 }
 

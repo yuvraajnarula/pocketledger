@@ -76,8 +76,14 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			r.metrics.IncReconciledErrors()
 			continue
 		}
+		if err := r.repo.MarkReconciled(reqCtx, entry.ReferenceID); err != nil {
+			slog.Error("reconciler: failed to mark reconciled",
+				"ref", entry.ReferenceID, "error", err)
+			r.metrics.IncReconciledErrors()
+			continue
+		}
 
-		if err := r.repo.MarkReconciled(ctx, entry.ReferenceID); err != nil {
+		if err := r.repo.MarkReconciled(reqCtx, entry.ReferenceID); err != nil {
 			slog.Error("reconciler: failed to mark reconciled",
 				"ref", entry.ReferenceID, "error", err)
 			r.metrics.IncReconciledErrors()

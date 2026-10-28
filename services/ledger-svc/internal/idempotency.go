@@ -26,10 +26,10 @@ func (s *IdempotencyStore) CheckOrInsert(ctx context.Context, key string) (strin
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx,
-    `INSERT INTO idempotency_keys (key, status, expires_at)
-     VALUES ($1, 'PENDING', NOW() + INTERVAL '24 hours')
-     ON CONFLICT (key) DO NOTHING`, key)
+	query := queryForDriver(s.db, `INSERT INTO idempotency_keys (key, status, expires_at)
+     VALUES (?, 'PENDING', ?)
+     ON CONFLICT (key) DO NOTHING`)
+	res, err := tx.ExecContext(ctx, query, key, time.Now().UTC().Add(24*time.Hour))
 	if err != nil {
 		return "", fmt.Errorf("idempotency insert: %w", err)
 	}
@@ -43,7 +43,7 @@ func (s *IdempotencyStore) CheckOrInsert(ctx context.Context, key string) (strin
 		// Key already exists — read its current status inside the same tx.
 		var status string
 		if err := tx.QueryRowContext(ctx,
-			"SELECT status FROM idempotency_keys WHERE key = $1", key).Scan(&status); err != nil {
+			queryForDriver(s.db, "SELECT status FROM idempotency_keys WHERE key = ?"), key).Scan(&status); err != nil {
 			return "", fmt.Errorf("idempotency status check: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -63,9 +63,9 @@ func (s *IdempotencyStore) CompleteKey(ctx context.Context, key string, code int
 	defer cancel()
 
 	res, err := s.db.ExecContext(cacheCtx,
-		`UPDATE idempotency_keys 
-		SET status = 'COMPLETED', response_code = $1, response_body = $2
-		WHERE key = $3 AND status = 'PENDING'`, code, string(body), key)
+		queryForDriver(s.db, `UPDATE idempotency_keys 
+		SET status = 'COMPLETED', response_code = ?, response_body = ?
+		WHERE key = ? AND status = 'PENDING'`), code, string(body), key)
 
 	if err != nil {
 		return fmt.Errorf("complete idempotency key: %w", err)
@@ -81,7 +81,7 @@ func (s *IdempotencyStore) FailKey(ctx context.Context, key string) error {
 	cacheCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_, err := s.db.ExecContext(cacheCtx,
-		`DELETE FROM idempotency_keys WHERE key = $1 AND status = 'PENDING'`, key)
+		queryForDriver(s.db, `DELETE FROM idempotency_keys WHERE key = ? AND status = 'PENDING'`), key)
 	return err
 }
 
@@ -89,8 +89,8 @@ func (s *IdempotencyStore) GetCachedResponse(ctx context.Context, key string) (i
 	var code int
 	var body sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT response_code, response_body FROM idempotency_keys
-		WHERE key = $1 AND status = 'COMPLETED'`, key).Scan(&code, &body)
+		queryForDriver(s.db, `SELECT response_code, response_body FROM idempotency_keys
+		WHERE key = ? AND status = 'COMPLETED'`), key).Scan(&code, &body)
 
 	if err == sql.ErrNoRows {
 		return 0, nil, nil

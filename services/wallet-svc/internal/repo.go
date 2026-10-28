@@ -51,39 +51,39 @@ type executer interface {
 }
 
 func (r *WalletRepo) IdempotentCredit(ctx context.Context, tx *sql.Tx, walletID, refID string, amount int64) (bool, error) {
-    var already bool
-    err := tx.QueryRowContext(ctx,
-    "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = ?)", refID,
-    ).Scan(&already)
+	var already bool
+	err := tx.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = ?)", refID,
+	).Scan(&already)
 
-    if err != nil {
-        return false, err
-    }
-    if already {
-        return false, nil // idempotent no-op
-    }
+	if err != nil {
+		return false, err
+	}
+	if already {
+		return false, nil // idempotent no-op
+	}
 
-    res, err := tx.ExecContext(ctx,
-        `UPDATE wallets SET balance = balance + ?, version = version + 1, updated_at = ?
+	res, err := tx.ExecContext(ctx,
+		`UPDATE wallets SET balance = balance + ?, version = version + 1, updated_at = ?
          WHERE id = ?`,
-        amount, time.Now().UTC(), walletID,
-    )
-    if err != nil {
-        return false, err
-    }
-    rows, _ := res.RowsAffected()
-    if rows == 0 {
-        return false, domain.ErrWalletNotFound
-    }
+		amount, time.Now().UTC(), walletID,
+	)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return false, domain.ErrWalletNotFound
+	}
 
-    _, err = tx.ExecContext(ctx,
-        `INSERT INTO idempotency_keys (key, status, request_hash, response_code, response_body, created_at, expires_at)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO idempotency_keys (key, status, request_hash, response_code, response_body, created_at, expires_at)
          VALUES (?, 'completed', ?, 200, '{"status":"credited"}', ?, ?)`,
-        refID, refID, time.Now().UTC(), time.Now().Add(24*time.Hour),
-    )
-    if err != nil {
-        return false, err
-    }
+		refID, refID, time.Now().UTC(), time.Now().Add(24*time.Hour),
+	)
+	if err != nil {
+		return false, err
+	}
 
-    return true, nil
+	return true, nil
 }

@@ -53,7 +53,7 @@ func (s *TransferService) Execute(ctx context.Context, srcID, destID string, amo
 	if amount <= 0 {
 		return domain.ErrInvalidAmount
 	}
-	
+
 	if srcID == bankWalletID {
 		return s.executeBankDeposit(ctx, srcID, destID, amount, refID)
 	}
@@ -104,6 +104,7 @@ func (s *TransferService) executeBankDeposit(ctx context.Context, srcID, destID 
 		if err := s.recordLedger(ctx, tx, srcID, destID, srcBal, amount, refID); err != nil {
 			return err
 		}
+
 		if err := tx.Commit(); err != nil {
 			return err
 		}

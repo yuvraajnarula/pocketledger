@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/yuvraajnarula/pocketledger/services/ledger-svc/internal"
+	"github.com/yuvraajnarula/pocketledger/shared/domain"
 )
 
 func newLedgerTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
@@ -39,7 +41,31 @@ func newLedgerTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	CREATE TABLE IF NOT EXISTS event_log (
 		id INTEGER PRIMARY KEY AUTOINCREMENT, aggregate_id TEXT,
 		event_type TEXT, payload TEXT, created_at DATETIME
-	);`
+	);
+	CREATE TABLE IF NOT EXISTS tenants (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		status TEXT NOT NULL DEFAULT 'active',
+		scopes TEXT NOT NULL DEFAULT '[]',
+		rate_limit_rps REAL NOT NULL DEFAULT 100,
+		rate_limit_burst INTEGER NOT NULL DEFAULT 100,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS api_keys (
+		id TEXT PRIMARY KEY,
+		tenant_id TEXT NOT NULL REFERENCES tenants(id),
+		name TEXT NOT NULL,
+		key_hash TEXT NOT NULL,
+		scopes TEXT NOT NULL DEFAULT '[]',
+		rate_limit_rps REAL NOT NULL DEFAULT 100,
+		rate_limit_burst INTEGER NOT NULL DEFAULT 100,
+		status TEXT NOT NULL DEFAULT 'active',
+		created_by TEXT,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		revoked_at DATETIME
+	);
+	`
 	if _, err := db.Exec(schema); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
@@ -48,15 +74,33 @@ func newLedgerTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	cfg.RateLimits.Default.RequestsPerSecond = 1000
 	cfg.RateLimits.Default.Burst = 1000
 	rl := internal.NewLocalRateLimiter(cfg)
-	handler := internal.NewHandler(db, rl)
+	authStore := internal.NewAPIKeyStore(db, domain.NewAPIKeyVerifier("test-secret"))
+	t.Setenv("API_KEY_STORE_DISABLED", "1")
+	t.Setenv("API_KEY", "test-ledger-api-key")
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin seed tx: %v", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`INSERT INTO tenants (id, name, status, scopes) VALUES ('t1', 'test-tenant', 'active', '[]')`)
+	if err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	_, err = tx.Exec(`INSERT INTO api_keys (id, tenant_id, name, key_hash, scopes, status) VALUES ('k1', 't1', 'test-key', ?, '[]', 'active')`, domain.NewAPIKeyVerifier("test-secret").KeyHash("test-ledger-api-key"))
+	if err != nil {
+		t.Fatalf("seed api key: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	handler := internal.NewHandler(db, rl, nil, authStore)
 	idemStore := internal.NewIdempotencyStore(db)
 	idemMiddleware := internal.NewIdempotencyMiddleware(idemStore)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)
-	mux.HandleFunc("GET /health", handler.Health)
 
-	protected := idemMiddleware.Handle(mux)
+	protected := internal.AuthMiddleware(authStore)(idemMiddleware.Handle(mux))
 	return httptest.NewServer(protected), db
 }
 
@@ -72,6 +116,9 @@ func doJSON(method, url string, body any, idemKey ...string) (*http.Response, ma
 	if len(idemKey) > 0 && idemKey[0] != "" {
 		req.Header.Set("Idempotency-Key", idemKey[0])
 	}
+	if apiKey := os.Getenv("API_KEY"); apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -82,7 +129,6 @@ func doJSON(method, url string, body any, idemKey ...string) (*http.Response, ma
 	json.Unmarshal(bodyBytes, &result)
 	return resp, result, nil
 }
-
 func seedWallets(t *testing.T, db *sql.DB, src, dest string, srcBal, destBal int64) {
 	t.Helper()
 	tx, err := db.Begin()
@@ -90,7 +136,6 @@ func seedWallets(t *testing.T, db *sql.DB, src, dest string, srcBal, destBal int
 		t.Fatalf("begin seed tx: %v", err)
 	}
 	defer tx.Rollback()
-
 	// Insert wallets
 	_, err = tx.Exec(`INSERT INTO wallets (id, currency, balance, version, created_at, updated_at)
 		VALUES (?, 'USD', ?, 0, datetime('now'), datetime('now')),

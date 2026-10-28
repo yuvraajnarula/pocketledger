@@ -1,52 +1,54 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"log/slog"
 	"net/http"
-	"time"
 	"os"
+	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/yuvraajnarula/pocketledger/services/wallet-svc/internal"
+	"github.com/yuvraajnarula/pocketledger/shared/domain"
 )
 
 func buildLedgerClient() *http.Client {
-    certFile := os.Getenv("LEDGER_SVC_CLIENT_CERT_FILE")
-    keyFile  := os.Getenv("LEDGER_SVC_CLIENT_KEY_FILE")
-    caFile   := os.Getenv("LEDGER_SVC_CA_FILE")
+	certFile := os.Getenv("LEDGER_SVC_CLIENT_CERT_FILE")
+	keyFile := os.Getenv("LEDGER_SVC_CLIENT_KEY_FILE")
+	caFile := os.Getenv("LEDGER_SVC_CA_FILE")
 
-    if certFile == "" || keyFile == "" || caFile == "" {
-        return &http.Client{Timeout: 10 * time.Second}
-    }
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return &http.Client{Timeout: 10 * time.Second}
+	}
 
-    caCert, err := os.ReadFile(caFile)
-    if err != nil {
-        slog.Error("failed to read ledger CA cert", "error", err)
-        os.Exit(1)
-    }
-    caCertPool := x509.NewCertPool()
-    caCertPool.AppendCertsFromPEM(caCert)
+	caCert, err := os.ReadFile(caFile)
+	if err != nil {
+		slog.Error("failed to read ledger CA cert", "error", err)
+		os.Exit(1)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
 
-    cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-    if err != nil {
-        slog.Error("failed to load ledger client cert", "error", err)
-        os.Exit(1)
-    }
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		slog.Error("failed to load ledger client cert", "error", err)
+		os.Exit(1)
+	}
 
-    return &http.Client{
-        Timeout: 10 * time.Second,
-        Transport: &http.Transport{
-            TLSClientConfig: &tls.Config{
-                Certificates: []tls.Certificate{cert},
-                RootCAs:      caCertPool,
-                MinVersion:   tls.VersionTLS12,
-            },
-        },
-    }
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				RootCAs:      caCertPool,
+				MinVersion:   tls.VersionTLS12,
+			},
+		},
+	}
 }
 
 func main() {
@@ -99,7 +101,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := internal.NewHandler(db, buildLedgerClient())
+	authStore := internal.NewAPIKeyStore(db, domain.NewAPIKeyVerifier(os.Getenv("API_KEY_VERIFIER_SECRET")))
+	authStore.EnsureSchema(context.Background())
+
+	handler := internal.NewHandler(db, buildLedgerClient(), authStore)
 	metrics := internal.NewMetrics(func() (int64, int64, error) {
 		var wallets, entries int64
 		err := db.QueryRow("SELECT COUNT(*) FROM wallets").Scan(&wallets)
@@ -114,7 +119,10 @@ func main() {
 	mux := http.NewServeMux()
 	handler.Register(mux)
 	mux.HandleFunc("GET /health", handler.Health)
+	mux.HandleFunc("GET /readyz", handler.Readyz)
 	mux.HandleFunc("GET /metrics", handler.Metrics)
+
+	protected := internal.AuthMiddleware(authStore)(mux)
 
 	addr := ":8081"
 	slog.Info("wallet-svc starting", "addr", addr)
@@ -139,7 +147,7 @@ func main() {
 		}
 		server := &http.Server{
 			Addr:      ":8081",
-			Handler:   mux,
+			Handler:   protected,
 			TLSConfig: tlsConfig,
 		}
 		slog.Info("wallet-svc starting with mTLS", "addr", ":8081")
@@ -148,7 +156,7 @@ func main() {
 		}
 	} else {
 		slog.Info("wallet-svc starting (plain HTTP)", "addr", ":8081")
-		if err := http.ListenAndServe(":8081", mux); err != nil {
+		if err := http.ListenAndServe(":8081", protected); err != nil {
 			slog.Error("server failed", "error", err)
 		}
 	}

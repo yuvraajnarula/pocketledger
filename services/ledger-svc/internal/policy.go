@@ -63,7 +63,7 @@ func ValidatePolicy(amount int64, hasMemo bool) error {
 		)
 	}
 
-	if amount > policy.RequireMemoAbove && !hasMemo {
+	if policy.RequireMemoAbove > 0 && amount > policy.RequireMemoAbove && !hasMemo {
 		return fmt.Errorf(
 			"memo required for amounts above %d",
 			policy.RequireMemoAbove,

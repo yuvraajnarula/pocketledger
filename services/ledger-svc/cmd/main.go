@@ -16,6 +16,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"github.com/yuvraajnarula/pocketledger/services/ledger-svc/internal"
+	"github.com/yuvraajnarula/pocketledger/shared/domain"
 )
 
 const (
@@ -161,10 +162,17 @@ func main() {
 
 	rateLimiter := internal.NewLocalRateLimiter(policyCfg)
 
+	// ── Auth / tenant store ──────────────────────────────────────────────────
+	authStore := internal.NewAPIKeyStore(db, domain.NewAPIKeyVerifier(os.Getenv("API_KEY_VERIFIER_SECRET")))
+	if err := authStore.EnsureSchema(context.Background()); err != nil {
+		slog.Error("auth store schema", "error", err)
+		os.Exit(1)
+	}
+
 	// ── Handler & metrics ────────────────────────────────────────────────────
 	// Pass chaos so handler.ToggleChaos and ChaosMiddleware share the same
 	// atomic flag — no coordination needed.
-	handler := internal.NewHandler(db, rateLimiter, chaos)
+	handler := internal.NewHandler(db, rateLimiter, chaos, authStore)
 
 	metrics := internal.NewMetrics()
 	metrics.SetDBQuery(func() (int64, int64, error) {
@@ -184,18 +192,21 @@ func main() {
 
 	// ── Middleware chain ─────────────────────────────────────────────────────
 	//
-	//   Request → ChaosMiddleware → IdempotencyMiddleware → mux
+	//   Request → AuthMiddleware → ChaosMiddleware → IdempotencyMiddleware → mux
 	//
-	// Chaos is outermost so it can short-circuit before idempotency writes
-	// anything to the DB. /health, /admin/chaos, and /metrics are exempt
-	// inside ChaosMiddleware so the toggle itself is never chaos'd.
+	// Auth is outermost because it attaches the tenant/request context used by
+	// rate limiting, idempotency, and handlers. Chaos sits above idempotency so
+	// it can fault before any idempotency writes. /health, /readyz, /metrics,
+	// and /admin/chaos are exempt where needed.
 	idemStore := internal.NewIdempotencyStore(db)
 	idemMiddleware := internal.NewIdempotencyMiddleware(idemStore)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)
 
-	finalHandler := internal.AuthMiddleware(internal.ChaosMiddleware(chaos)(idemMiddleware.Handle(mux)))
+	finalHandler := internal.AuthMiddleware(authStore)(
+		internal.ChaosMiddleware(chaos)(idemMiddleware.Handle(mux)),
+	)
 
 	// ── Webhook worker ───────────────────────────────────────────────────────
 	webhookCfg := internal.WebhookWorkerConfig{

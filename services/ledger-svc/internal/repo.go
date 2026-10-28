@@ -21,8 +21,8 @@ func (r *LedgerRepo) InsertEntries(ctx context.Context, tx *sql.Tx, entries []do
 	for _, e := range entries {
 		id := uuid.New().String()
 		_, err := tx.ExecContext(ctx,
-			`INSERT INTO ledger_entries (id, wallet_id, entry_type, amount, reference_id, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			queryForDriver(r.db, `INSERT INTO ledger_entries (id, wallet_id, entry_type, amount, reference_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`),
 			id, e.WalletID, e.EntryType, e.Amount, e.ReferenceID, time.Now().UTC())
 		if err != nil {
 			return err
@@ -58,21 +58,21 @@ func (r *LedgerRepo) GetUnreconciledDeposits(ctx context.Context) ([]Unreconcile
 
 // MarkReconciled sets reconciled=true for all entries with the given reference_id.
 func (r *LedgerRepo) MarkReconciled(ctx context.Context, refID string) error {
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.ExecContext(ctx,
+		queryForDriver(r.db, `
 		UPDATE ledger_entries
 		SET reconciled = true, reconciled_at = NOW()
-		WHERE reference_id = $1
-	`, refID)
+		WHERE reference_id = ?`), refID)
 	return err
 }
 
 // MarkUnreconciled sets reconciled=false for all entries with the given reference_id.
 func (r *LedgerRepo) MarkUnreconciled(ctx context.Context, refID string) error {
-	_, err := r.db.ExecContext(ctx, `
+	_, err := r.db.ExecContext(ctx,
+		queryForDriver(r.db, `
 		UPDATE ledger_entries
 		SET reconciled = false
-		WHERE reference_id = $1
-	`, refID)
+		WHERE reference_id = ?`), refID)
 	return err
 }
 

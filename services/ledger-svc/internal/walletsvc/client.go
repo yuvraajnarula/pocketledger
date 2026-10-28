@@ -45,7 +45,7 @@ func NewClient(baseURL string) *Client {
 	if !caCertPool.AppendCertsFromPEM(caCertPEM) {
 		panic("failed to parse CA certificate")
 	}
-	slog.Info("mTLS client configured", "cert", clientCertFile, 		"key", clientKeyFile, 		"ca", caCertFile,		"subject", cert.Leaf.Subject)
+	slog.Info("mTLS client configured", "cert", clientCertFile, "key", clientKeyFile, "ca", caCertFile, "subject", cert.Leaf.Subject)
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},

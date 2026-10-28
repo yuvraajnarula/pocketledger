@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,26 +15,35 @@ import (
 )
 
 type Handler struct {
-	db          *sql.DB
-	metrics     *Metrics
-	walletRepo  *WalletRepo
-	ledgerRepo  *LedgerRepo
-	eventRepo   *EventRepo
-	idemStore   *IdempotencyStore
-	transferSvc *TransferService
-	advancedSvc *AdvancedService
-	proofEngine *ProofEngine
-	chaos       *ChaosController // replaces the old *ChaosConfig field
-	rateLimiter RateLimiter
+	db           *sql.DB
+	metrics      *Metrics
+	walletRepo   *WalletRepo
+	ledgerRepo   *LedgerRepo
+	eventRepo    *EventRepo
+	idemStore    *IdempotencyStore
+	transferSvc  *TransferService
+	walletClient *walletsvc.Client
+	advancedSvc  *AdvancedService
+	proofEngine  *ProofEngine
+	chaos        *ChaosController // replaces the old *ChaosConfig field
+	rateLimiter  RateLimiter
+	authStore    *APIKeyStore
 }
 
 func (h *Handler) WalletClient() *walletsvc.Client {
+	if h.walletClient != nil {
+		return h.walletClient
+	}
 	return h.transferSvc.WalletClient
+}
+
+func (h *Handler) SetWalletClient(wc *walletsvc.Client) {
+	h.walletClient = wc
 }
 
 // NewHandler now accepts a pre-built *ChaosController so main.go owns the
 // single instance that is also passed to ChaosMiddleware.
-func NewHandler(db *sql.DB, rl RateLimiter, chaos *ChaosController) *Handler {
+func NewHandler(db *sql.DB, rl RateLimiter, chaos *ChaosController, authStore *APIKeyStore) *Handler {
 	wr := NewWalletRepo(db)
 	lr := NewLedgerRepo(db)
 	er := NewEventRepo(db)
@@ -41,22 +51,25 @@ func NewHandler(db *sql.DB, rl RateLimiter, chaos *ChaosController) *Handler {
 
 	ts := NewTransferService(db, wr, lr)
 
+	var walletClient *walletsvc.Client
 	if walletURL := os.Getenv("WALLET_SVC_URL"); walletURL != "" {
-		wc := walletsvc.NewClient(walletURL)
-		ts = ts.WithWalletClient(wc)
+		walletClient = walletsvc.NewClient(walletURL)
+		ts = ts.WithWalletClient(walletClient)
 	}
 
 	h := &Handler{
-		db:          db,
-		walletRepo:  wr,
-		ledgerRepo:  lr,
-		eventRepo:   er,
-		idemStore:   is,
-		transferSvc: ts,
-		advancedSvc: NewAdvancedService(db),
-		proofEngine: NewProofEngine(os.Getenv("PROOF_SECRET_KEY")),
-		chaos:       chaos,
-		rateLimiter: rl,
+		db:           db,
+		walletRepo:   wr,
+		ledgerRepo:   lr,
+		eventRepo:    er,
+		idemStore:    is,
+		transferSvc:  ts,
+		walletClient: walletClient,
+		advancedSvc:  NewAdvancedService(db),
+		proofEngine:  NewProofEngine(os.Getenv("PROOF_SECRET_KEY")),
+		chaos:        chaos,
+		rateLimiter:  rl,
+		authStore:    authStore,
 	}
 
 	if policyPath := os.Getenv("POLICY_CONFIG_PATH"); policyPath != "" {
@@ -97,6 +110,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /admin/postmortem", h.GeneratePostMortem)
 
 	mux.HandleFunc("GET /health", h.Health)
+	mux.HandleFunc("GET /readyz", h.Readyz)
 	mux.HandleFunc("GET /metrics", h.Metrics)
 }
 
@@ -298,6 +312,43 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
+}
+
+func (h *Handler) Readyz(w http.ResponseWriter, r *http.Request) {
+	type probe struct {
+		Name string `json:"name"`
+		OK   bool   `json:"ok"`
+		Err  string `json:"error,omitempty"`
+	}
+	probes := []probe{
+		{Name: "database", OK: true},
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.db.PingContext(ctx); err != nil {
+		probes[0].OK = false
+		probes[0].Err = err.Error()
+	}
+
+	allOK := true
+	for _, p := range probes {
+		if !p.OK {
+			allOK = false
+			break
+		}
+	}
+
+	status := http.StatusOK
+	if !allOK {
+		status = http.StatusServiceUnavailable
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  allOK,
+		"probes":  probes,
+		"version": "0.1.0",
+	})
 }
 
 func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {

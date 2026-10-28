@@ -20,7 +20,9 @@ func (s *AdvancedService) ConvertAmount(ctx context.Context, from, to string, am
 	query := queryForDriver(s.db, "SELECT rate FROM fx_rates WHERE base_currency=? AND target_currency=?")
 	err := s.db.QueryRowContext(ctx, query, from, to).Scan(&rate)
 	if err != nil {
-		if from == to { return amount, nil }
+		if from == to {
+			return amount, nil
+		}
 		return 0, fmt.Errorf("fx rate not found for %s/%s", from, to)
 	}
 	return int64(float64(amount) * rate), nil
@@ -35,31 +37,44 @@ func (s *AdvancedService) QueueWebhook(ctx context.Context, eventType, payloadJS
 
 func (s *AdvancedService) CreateDispute(ctx context.Context, refID, walletID string, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer tx.Rollback()
 
 	// Find original entries
 	query := queryForDriver(s.db, `SELECT entry_type, amount FROM ledger_entries WHERE reference_id=?`)
 	rows, err := tx.QueryContext(ctx, query, refID)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer rows.Close()
 
 	var totalAmount int64
 	for rows.Next() {
-		var t string; var amt int64
-		if err := rows.Scan(&t, &amt); err != nil { return err }
-		if t == "DEBIT" { totalAmount += amt }
+		var t string
+		var amt int64
+		if err := rows.Scan(&t, &amt); err != nil {
+			return err
+		}
+		if t == "DEBIT" {
+			totalAmount += amt
+		}
 	}
-	if totalAmount == 0 { return fmt.Errorf("no transactions found for ref: %s", refID) }
+	if totalAmount == 0 {
+		return fmt.Errorf("no transactions found for ref: %s", refID)
+	}
 
 	query = queryForDriver(s.db, `INSERT INTO ledger_entries (id, wallet_id, entry_type, amount, reference_id, created_at) 
 		 VALUES (?, ?, 'CREDIT', ?, 'DISPUTE_REVERSAL_' || ?, ?)`)
 	_, err = tx.ExecContext(ctx, query, "disp-"+refID, walletID, totalAmount, refID, time.Now().UTC())
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	query = queryForDriver(s.db, `INSERT INTO event_log (aggregate_id, event_type, payload, created_at) VALUES (?, 'dispute.created', ?, ?)`)
 	_, err = tx.ExecContext(ctx, query, walletID, fmt.Sprintf(`{"ref":"%s","reason":"%s","amount":%d}`, refID, reason, totalAmount), time.Now().UTC())
-	
+
 	return tx.Commit()
 }
 
@@ -72,7 +87,9 @@ func (s *AdvancedService) GeneratePostMortem(ctx context.Context) (string, error
 
 	diff := totalCred - totalDeb - totalWallet
 	status := "BALANCED"
-	if diff != 0 { status = "DISCREPANCY" }
+	if diff != 0 {
+		status = "DISCREPANCY"
+	}
 
 	var eventCount int
 	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM event_log").Scan(&eventCount)
