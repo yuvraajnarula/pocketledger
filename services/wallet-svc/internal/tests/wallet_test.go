@@ -199,7 +199,6 @@ func TestWalletLifecycle(t *testing.T) {
 	if finalBalance != 3000 {
 		t.Errorf("expected final balance 3000, got %d", finalBalance)
 	}
-	_, _ = wd1Resp, wd1Body
 }
 
 func readBalance(t *testing.T, db *sql.DB, id string) int64 {
@@ -207,4 +206,55 @@ func readBalance(t *testing.T, db *sql.DB, id string) int64 {
 	var b int64
 	db.QueryRow("SELECT balance FROM wallets WHERE id = ?", id).Scan(&b)
 	return b
+}
+
+func TestListWallets(t *testing.T) {
+	ts, _ := newTestServer(t)
+	defer ts.Close()
+
+	for i := 0; i < 3; i++ {
+		resp, body, err := doJSON(http.MethodPost, ts.URL+"/wallets", map[string]string{"currency": "USD"})
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create wallet %d: err=%v status=%d body=%+v", i, err, resp.StatusCode, body)
+		}
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/wallets", nil)
+	req.Header.Set("X-API-Key", os.Getenv("API_KEY"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var wallets []map[string]any
+	if err := json.Unmarshal(raw, &wallets); err != nil {
+		t.Fatalf("wallets not a JSON array: %s", raw)
+	}
+	if len(wallets) != 3 {
+		t.Errorf("expected 3 wallets, got %d", len(wallets))
+	}
+	for _, w := range wallets {
+		if w["currency"] != "USD" || w["balance"] != float64(0) {
+			t.Errorf("unexpected wallet shape: %v", w)
+		}
+	}
+
+	// limit works
+	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"/wallets?limit=2", nil)
+	req2.Header.Set("X-API-Key", os.Getenv("API_KEY"))
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatalf("list limit: %v", err)
+	}
+	defer resp2.Body.Close()
+	raw2, _ := io.ReadAll(resp2.Body)
+	var limited []map[string]any
+	if err := json.Unmarshal(raw2, &limited); err != nil {
+		t.Fatalf("limit wallets not a JSON array: %s", raw2)
+	}
+	if len(limited) != 2 {
+		t.Errorf("expected 2 wallets with limit=2, got %d", len(limited))
+	}
 }

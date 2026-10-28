@@ -81,8 +81,11 @@ func main() {
 		reference_id TEXT,
 		created_at TIMESTAMP,
 		reconciled BOOLEAN DEFAULT TRUE,
-		reconciled_at TIMESTAMP
+		reconciled_at TIMESTAMP,
+		reconcile_attempts INTEGER DEFAULT 0
 	);
+	-- Migration for deployments that predate the dead-letter cap column.
+	ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS reconcile_attempts INTEGER DEFAULT 0;
 	CREATE TABLE IF NOT EXISTS idempotency_keys (
 		key TEXT PRIMARY KEY,
 		status TEXT,

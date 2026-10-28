@@ -9,4 +9,5 @@ var (
 	ErrWalletNotFound      = errors.New("wallet not found")
 	ErrIdempotencyConflict = errors.New("request in progress or already completed")
 	ErrOptimisticLockFail  = errors.New("concurrent modification detected")
+	ErrCurrencyMismatch    = errors.New("wallet currencies differ; use FX transfer endpoint")
 )

@@ -2,10 +2,12 @@ package internal
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,8 +38,8 @@ func (s *APIKeyStore) EnsureSchema(ctx context.Context) error {
 			scopes TEXT NOT NULL DEFAULT '[]',
 			rate_limit_rps REAL NOT NULL DEFAULT 100,
 			rate_limit_burst INTEGER NOT NULL DEFAULT 100,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE TABLE IF NOT EXISTS api_keys (
 			id TEXT PRIMARY KEY,
@@ -49,7 +51,7 @@ func (s *APIKeyStore) EnsureSchema(ctx context.Context) error {
 			rate_limit_burst INTEGER NOT NULL DEFAULT 100,
 			status TEXT NOT NULL DEFAULT 'active',
 			created_by TEXT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			revoked_at TIMESTAMPTZ
 		);
 		CREATE TABLE IF NOT EXISTS audit_notes (
@@ -59,7 +61,7 @@ func (s *APIKeyStore) EnsureSchema(ctx context.Context) error {
 			actor TEXT NOT NULL,
 			action TEXT NOT NULL,
 			note TEXT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
 		CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
@@ -122,7 +124,7 @@ func parseJSONScopes(raw string) []domain.TenantScope {
 // Tenant returns a tenant by ID.
 func (s *APIKeyStore) Tenant(ctx context.Context, id string) (*TenantRow, error) {
 	row := s.db.QueryRowContext(ctx,
-		"SELECT id, name, status, scopes, rate_limit_rps, rate_limit_burst, created_at, updated_at FROM tenants WHERE id = $1",
+		queryForDriver(s.db, "SELECT id, name, status, scopes, rate_limit_rps, rate_limit_burst, created_at, updated_at FROM tenants WHERE id = ?"),
 		id,
 	)
 	return scanTenant(row)
@@ -133,10 +135,10 @@ func (s *APIKeyStore) ListTenants(ctx context.Context, status domain.TenantStatu
 	query := "SELECT id, name, status, scopes, rate_limit_rps, rate_limit_burst, created_at, updated_at FROM tenants"
 	var args []any
 	if status != "" {
-		query += " WHERE status = $1"
+		query += " WHERE status = ?"
 		args = append(args, string(status))
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, queryForDriver(s.db, query), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -155,8 +157,8 @@ func (s *APIKeyStore) CreateTenant(ctx context.Context, req CreateTenantRequest)
 		return nil, err
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO tenants (id, name, status, scopes, rate_limit_rps, rate_limit_burst)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		queryForDriver(s.db, `INSERT INTO tenants (id, name, status, scopes, rate_limit_rps, rate_limit_burst)
+		 VALUES (?, ?, ?, ?, ?, ?)`),
 		id, req.Name, string(req.Status), scopesJSON, req.RateLimitRPS, req.RateLimitBurst,
 	)
 	if err != nil {
@@ -181,8 +183,8 @@ func (s *APIKeyStore) CreateAPIKey(ctx context.Context, rawKey string, req Creat
 	}
 	hash := s.verifier.KeyHash(rawKey)
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO api_keys (id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		queryForDriver(s.db, `INSERT INTO api_keys (id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
 		keyID, req.TenantID, req.Name, hash, scopesJSON, req.RateLimitRPS, req.RateLimitBurst, string(req.Status), req.CreatedBy,
 	)
 	if err != nil {
@@ -209,13 +211,15 @@ type APIKeyRow struct {
 func scanAPIKey(row *sql.Row) (*APIKeyRow, error) {
 	var r APIKeyRow
 	var scopesRaw string
+	var createdBy sql.NullString
 	err := row.Scan(
 		&r.ID, &r.TenantID, &r.Name, &r.KeyHash, &scopesRaw,
-		&r.RateLimitRPS, &r.RateLimitBurst, &r.Status, &r.CreatedBy, &r.CreatedAt, &r.RevokedAt,
+		&r.RateLimitRPS, &r.RateLimitBurst, &r.Status, &createdBy, &r.CreatedAt, &r.RevokedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+	r.CreatedBy = createdBy.String
 	r.Scopes = parseJSONScopes(scopesRaw)
 	return &r, nil
 }
@@ -223,8 +227,8 @@ func scanAPIKey(row *sql.Row) (*APIKeyRow, error) {
 // APIKey returns an API key by ID.
 func (s *APIKeyStore) APIKey(ctx context.Context, id string) (*APIKeyRow, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by, created_at, revoked_at
-		 FROM api_keys WHERE id = $1`,
+		queryForDriver(s.db, `SELECT id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by, created_at, revoked_at
+		 FROM api_keys WHERE id = ?`),
 		id,
 	)
 	return scanAPIKey(row)
@@ -235,8 +239,8 @@ func (s *APIKeyStore) APIKey(ctx context.Context, id string) (*APIKeyRow, error)
 func (s *APIKeyStore) ResolveAPIKey(ctx context.Context, rawKey string) (*APIKeyRow, error) {
 	hash := s.verifier.KeyHash(rawKey)
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by, created_at, revoked_at
-		 FROM api_keys WHERE key_hash = $1`,
+		queryForDriver(s.db, `SELECT id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by, created_at, revoked_at
+		 FROM api_keys WHERE key_hash = ?`),
 		hash,
 	)
 	return scanAPIKey(row)
@@ -260,7 +264,7 @@ func (s *APIKeyStore) Authenticate(ctx context.Context, rawKey string) (*APIKeyR
 // RevokeAPIKey marks a key revoked.
 func (s *APIKeyStore) RevokeAPIKey(ctx context.Context, keyID, actor string) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE api_keys SET status = 'revoked', revoked_at = NOW() WHERE id = $1 AND status = 'active'`,
+		queryForDriver(s.db, "UPDATE api_keys SET status = 'revoked', revoked_at = "+currentTimestampExpr(s.db)+" WHERE id = ? AND status = 'active'"),
 		keyID,
 	)
 	if err != nil {
@@ -273,6 +277,35 @@ func (s *APIKeyStore) RevokeAPIKey(ctx context.Context, keyID, actor string) err
 	return nil
 }
 
+// ListAPIKeys returns all API keys for a tenant.
+func (s *APIKeyStore) ListAPIKeys(ctx context.Context, tenantID string) ([]*APIKeyRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		queryForDriver(s.db, `SELECT id, tenant_id, name, key_hash, scopes, rate_limit_rps, rate_limit_burst, status, created_by, created_at, revoked_at
+		 FROM api_keys WHERE tenant_id = ? ORDER BY created_at DESC`),
+		tenantID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*APIKeyRow
+	for rows.Next() {
+		var r APIKeyRow
+		var scopesRaw string
+		var createdBy sql.NullString
+		if err := rows.Scan(
+			&r.ID, &r.TenantID, &r.Name, &r.KeyHash, &scopesRaw,
+			&r.RateLimitRPS, &r.RateLimitBurst, &r.Status, &createdBy, &r.CreatedAt, &r.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		r.CreatedBy = createdBy.String
+		r.Scopes = parseJSONScopes(scopesRaw)
+		out = append(out, &r)
+	}
+	return out, rows.Err()
+}
+
 // CreateAuditNote inserts a structured audit note.
 func (s *APIKeyStore) CreateAuditNote(ctx context.Context, req CreateAuditNoteRequest) error {
 	id := req.ID
@@ -280,8 +313,8 @@ func (s *APIKeyStore) CreateAuditNote(ctx context.Context, req CreateAuditNoteRe
 		id = uuid.NewString()
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_notes (id, entity_type, entity_id, actor, action, note)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		queryForDriver(s.db, `INSERT INTO audit_notes (id, entity_type, entity_id, actor, action, note)
+		 VALUES (?, ?, ?, ?, ?, ?)`),
 		id, req.EntityType, req.EntityID, req.Actor, req.Action, req.Note,
 	)
 	return err
@@ -290,8 +323,8 @@ func (s *APIKeyStore) CreateAuditNote(ctx context.Context, req CreateAuditNoteRe
 // ListAuditNotes returns audit notes for an entity.
 func (s *APIKeyStore) ListAuditNotes(ctx context.Context, entityType, entityID string) ([]*domain.AdminNote, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, entity_type, entity_id, actor, action, note, created_at
-		 FROM audit_notes WHERE entity_type = $1 AND entity_id = $2 ORDER BY created_at DESC`,
+		queryForDriver(s.db, `SELECT id, entity_type, entity_id, actor, action, note, created_at
+		 FROM audit_notes WHERE entity_type = ? AND entity_id = ? ORDER BY created_at DESC`),
 		entityType, entityID,
 	)
 	if err != nil {
@@ -302,10 +335,12 @@ func (s *APIKeyStore) ListAuditNotes(ctx context.Context, entityType, entityID s
 	for rows.Next() {
 		var n domain.AdminNote
 
+		var noteStr sql.NullString
 		var createdAt string
-		if err := rows.Scan(&n.ID, &n.EntityType, &n.EntityID, &n.Actor, &n.Action, &n.Note, &createdAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.EntityType, &n.EntityID, &n.Actor, &n.Action, &noteStr, &createdAt); err != nil {
 			return nil, err
 		}
+		n.Note = noteStr.String
 		if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 			n.CreatedAt = t
 		}
@@ -361,6 +396,8 @@ func HasScope(ctx context.Context, scope domain.TenantScope) bool {
 // It authenticates using the API key store, attaches a RequestContext, and exempts
 // health/metrics paths. If API_KEY_STORE_DISABLED is set, it falls back to the legacy
 // single shared key check so existing tooling can keep working during migration.
+// (API_KEY_STORE_DISABLED=1 disables the store path and enables the legacy check;
+// the confusingly named env var is kept for backward compatibility with deploy tooling.)
 func AuthMiddleware(store *APIKeyStore) func(http.Handler) http.Handler {
 	exempt := map[string]bool{
 		"/health":  true,
@@ -368,10 +405,11 @@ func AuthMiddleware(store *APIKeyStore) func(http.Handler) http.Handler {
 		"/metrics": true,
 	}
 
-	legacyDisabled := os.Getenv("API_KEY_STORE_DISABLED") == ""
-
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Read per-request so tests (and rolling config reloads) can flip modes.
+			storeDisabled := os.Getenv("API_KEY_STORE_DISABLED") != ""
+
 			if exempt[r.URL.Path] {
 				next.ServeHTTP(w, r)
 				return
@@ -383,7 +421,7 @@ func AuthMiddleware(store *APIKeyStore) func(http.Handler) http.Handler {
 				return
 			}
 
-			if legacyDisabled {
+			if !storeDisabled {
 				key, err := store.Authenticate(r.Context(), rawKey)
 				if err != nil {
 					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -440,4 +478,23 @@ type CreateAuditNoteRequest struct {
 	Actor      string
 	Action     string
 	Note       string
+}
+
+// GenerateRawAPIKey produces a new opaque key secret in the "pk_gen_<random>" shape.
+// The raw secret is shown exactly once at creation time; only its hash is stored.
+func GenerateRawAPIKey() (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const keyLen = 32
+	red := func(n int) int { return int(n) }
+	_ = red
+	b := make([]byte, keyLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString("pk_gen_")
+	for i := 0; i < keyLen; i++ {
+		sb.WriteByte(charset[int(b[i])%len(charset)])
+	}
+	return sb.String(), nil
 }

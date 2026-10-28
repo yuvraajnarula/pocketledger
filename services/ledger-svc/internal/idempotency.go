@@ -40,11 +40,39 @@ func (s *IdempotencyStore) CheckOrInsert(ctx context.Context, key string) (strin
 	}
 
 	if rows == 0 {
-		// Key already exists — read its current status inside the same tx.
+		// Key already exists — read its current status and expiry inside the same tx.
 		var status string
+		var expiresAny any
 		if err := tx.QueryRowContext(ctx,
-			queryForDriver(s.db, "SELECT status FROM idempotency_keys WHERE key = ?"), key).Scan(&status); err != nil {
+			queryForDriver(s.db, "SELECT status, expires_at FROM idempotency_keys WHERE key = ?"), key).Scan(&status, &expiresAny); err != nil {
 			return "", fmt.Errorf("idempotency status check: %w", err)
+		}
+		if exp, ok := expiresAny.(time.Time); ok && time.Now().UTC().After(exp) {
+			// Expired key: sweep and treat as reusable with a fresh PENDING row.
+			if _, err := tx.ExecContext(ctx,
+				queryForDriver(s.db, "DELETE FROM idempotency_keys WHERE key = ?"), key); err != nil {
+				return "", fmt.Errorf("idempotency expiry sweep: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				queryForDriver(s.db, `INSERT INTO idempotency_keys (key, status, expires_at) VALUES (?, 'PENDING', ?)`),
+				key, time.Now().UTC().Add(24*time.Hour)); err != nil {
+				return "", fmt.Errorf("idempotency reinsert: %w", err)
+			}
+			status = "NEW"
+		} else if !ok {
+			// Non-time scan (string datetime stored by the driver): parse it.
+			if exp := parseExpiresAt(expiresAny); !exp.IsZero() && time.Now().UTC().After(exp) {
+				if _, err := tx.ExecContext(ctx,
+					queryForDriver(s.db, "DELETE FROM idempotency_keys WHERE key = ?"), key); err != nil {
+					return "", fmt.Errorf("idempotency expiry sweep: %w", err)
+				}
+				if _, err := tx.ExecContext(ctx,
+					queryForDriver(s.db, `INSERT INTO idempotency_keys (key, status, expires_at) VALUES (?, 'PENDING', ?)`),
+					key, time.Now().UTC().Add(24*time.Hour)); err != nil {
+					return "", fmt.Errorf("idempotency reinsert: %w", err)
+				}
+				status = "NEW"
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return "", err
@@ -131,4 +159,37 @@ func (s *IdempotencyStore) ListKeys(ctx context.Context, limit int) ([]KeyInfo, 
 		keys = append(keys, k)
 	}
 	return keys, nil
+}
+
+// parseExpiresAt unpacks an expires_at value that arrived as a non-time type
+// (typically a string written by the SQLite driver in one of its layouts).
+func parseExpiresAt(v any) time.Time {
+	switch raw := v.(type) {
+	case time.Time:
+		return raw
+	case []byte:
+		return parseExpiresAtString(string(raw))
+	case string:
+		return parseExpiresAtString(raw)
+	default:
+		return time.Time{} // zero: unknown shape → do not treat as expired
+	}
+}
+
+func parseExpiresAtString(s string) time.Time {
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }

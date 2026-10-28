@@ -42,6 +42,10 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
+// maxReconcileAttempts is the dead-letter cap: after this many failed retries
+// a deposit stops being rescheduled and needs manual intervention.
+const maxReconcileAttempts = 15
+
 func (r *Reconciler) reconcile(ctx context.Context) {
 	r.metrics.RecordReconcileRun()
 
@@ -55,6 +59,11 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 	r.metrics.SetUnreconciledCount(int64(len(entries)))
 
 	if len(entries) == 0 {
+		return
+	}
+
+	if r.walletClient == nil {
+		slog.Error("reconciler: no wallet-svc client configured; cannot reconcile deposits")
 		return
 	}
 
@@ -73,17 +82,21 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				"ref", entry.ReferenceID,
 				"error", err,
 			)
-			r.metrics.IncReconciledErrors()
-			continue
-		}
-		if err := r.repo.MarkReconciled(reqCtx, entry.ReferenceID); err != nil {
-			slog.Error("reconciler: failed to mark reconciled",
-				"ref", entry.ReferenceID, "error", err)
+			_ = r.repo.IncReconcileAttempts(ctx, entry.ReferenceID)
+
+			if entry.Attempts+1 >= maxReconcileAttempts {
+				slog.Warn("reconciler: dead-letter — deposit exceeded retry cap, manual intervention required",
+					"wallet", entry.WalletID,
+					"amount", entry.Amount,
+					"ref", entry.ReferenceID,
+					"attempts", entry.Attempts+1,
+				)
+			}
 			r.metrics.IncReconciledErrors()
 			continue
 		}
 
-		if err := r.repo.MarkReconciled(reqCtx, entry.ReferenceID); err != nil {
+		if err := r.repo.MarkReconciled(ctx, entry.ReferenceID); err != nil {
 			slog.Error("reconciler: failed to mark reconciled",
 				"ref", entry.ReferenceID, "error", err)
 			r.metrics.IncReconciledErrors()

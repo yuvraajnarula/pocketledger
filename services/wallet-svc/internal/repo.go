@@ -50,6 +50,30 @@ type executer interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
+// List returns the most recent wallets, oldest first, capped at limit.
+func (r *WalletRepo) List(ctx context.Context, limit int) ([]*domain.Wallet, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, currency, balance, version, created_at, updated_at FROM wallets ORDER BY created_at DESC LIMIT ?",
+		limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*domain.Wallet
+	for rows.Next() {
+		w := &domain.Wallet{}
+		if err := rows.Scan(&w.ID, &w.Currency, &w.Balance, &w.Version, &w.CreatedAt, &w.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
 func (r *WalletRepo) IdempotentCredit(ctx context.Context, tx *sql.Tx, walletID, refID string, amount int64) (bool, error) {
 	var already bool
 	err := tx.QueryRowContext(ctx,

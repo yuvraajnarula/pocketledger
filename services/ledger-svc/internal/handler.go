@@ -109,6 +109,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/postmortem", h.GeneratePostMortem)
 	mux.HandleFunc("POST /admin/postmortem", h.GeneratePostMortem)
 
+	// Tenant / API key admin API.
+	mux.HandleFunc("POST /admin/tenants", h.CreateTenant)
+	mux.HandleFunc("GET /admin/tenants", h.ListTenants)
+	mux.HandleFunc("GET /admin/tenants/{id}", h.GetTenant)
+	mux.HandleFunc("POST /admin/tenants/{id}/keys", h.CreateAPIKey)
+	mux.HandleFunc("GET /admin/tenants/{id}/keys", h.ListAPIKeys)
+	mux.HandleFunc("POST /admin/keys/{keyId}/revoke", h.RevokeAPIKey)
+
 	mux.HandleFunc("GET /health", h.Health)
 	mux.HandleFunc("GET /readyz", h.Readyz)
 	mux.HandleFunc("GET /metrics", h.Metrics)
@@ -157,6 +165,8 @@ func (h *Handler) Transfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPaymentRequired, err)
 	case err == domain.ErrOptimisticLockFail:
 		writeError(w, http.StatusConflict, err)
+	case err == domain.ErrCurrencyMismatch:
+		writeError(w, http.StatusBadRequest, err)
 	case err != nil:
 		writeError(w, http.StatusInternalServerError, err)
 	default:
@@ -284,26 +294,422 @@ func (h *Handler) GetFXRates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-/* ---------------- STUBS ---------------- */
+/* ---------------- REAL IMPLEMENTATIONS (previously stubs) ---------------- */
 
+// TransferWithFX executes a cross-currency transfer via ExecuteFX.
 func (h *Handler) TransferWithFX(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	srcID := r.PathValue("src")
+
+	var req struct {
+		DestID string `json:"destination_id"`
+		Amount int64  `json:"amount"`
+		RefID  string `json:"reference_id"`
+		Memo   string `json:"memo"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.DestID == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidAmount)
+		return
+	}
+	if req.Amount <= 0 {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidAmount)
+		return
+	}
+
+	srcAmt, dstAmt, err := h.transferSvc.ExecuteFX(r.Context(), srcID, req.DestID, req.Amount, req.RefID)
+	switch {
+	case err == domain.ErrWalletNotFound:
+		writeError(w, http.StatusNotFound, err)
+	case err == domain.ErrInsufficientFunds:
+		writeError(w, http.StatusPaymentRequired, err)
+	case err == domain.ErrOptimisticLockFail:
+		writeError(w, http.StatusConflict, err)
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":             "transferred",
+			"source_amount":      srcAmt,
+			"destination_amount": dstAmt,
+		})
+	}
 }
 
+// ListWebhooks returns webhook delivery history from the webhook_queue table.
 func (h *Handler) ListWebhooks(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, []any{})
+	limit := 50
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+
+	deliveries, err := h.advancedSvc.ListWebhookDeliveries(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if deliveries == nil {
+		deliveries = []WebhookDelivery{}
+	}
+	writeJSON(w, http.StatusOK, deliveries)
 }
 
+// CreateDispute reversals the debit side of a reference via AdvancedService.
 func (h *Handler) CreateDispute(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	var req struct {
+		ReferenceID string `json:"reference_id"`
+		WalletID    string `json:"wallet_id"`
+		Reason      string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
+		return
+	}
+	if req.ReferenceID == "" || req.WalletID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("reference_id and wallet_id are required"))
+		return
+	}
+
+	if err := h.advancedSvc.CreateDispute(r.Context(), req.ReferenceID, req.WalletID, req.Reason); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reversed", "reference_id": req.ReferenceID})
 }
 
+// GetBalanceProof returns an HMAC proof of the wallet's current balance.
 func (h *Handler) GetBalanceProof(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	id := r.PathValue("id")
+	nonce := r.URL.Query().Get("nonce")
+
+	wallet, err := h.walletRepo.Get(r.Context(), nil, id)
+	if err == sql.ErrNoRows {
+		writeError(w, http.StatusNotFound, domain.ErrWalletNotFound)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	proof, err := h.proofEngine.GenerateBalanceProof(wallet.ID, wallet.Balance, nonce)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"wallet_id": wallet.ID,
+		"balance":   wallet.Balance,
+		"currency":  wallet.Currency,
+		"nonce":     nonce,
+		"proof":     proof,
+		"algorithm": "HMAC-SHA256",
+	})
 }
 
+// GeneratePostMortem returns the full text report from AdvancedService.
 func (h *Handler) GeneratePostMortem(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	report, err := h.advancedSvc.GeneratePostMortem(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(report))
+}
+
+/* ---------------- ADMIN API (tenants & API keys) ---------------- */
+
+// serializeTenant makes a JSON view of a TenantRow.
+func serializeTenant(t *TenantRow) map[string]any {
+	scopes := make([]string, 0, len(t.Scopes))
+	for _, s := range t.Scopes {
+		scopes = append(scopes, string(s))
+	}
+	return map[string]any{
+		"id":               t.ID,
+		"name":             t.Name,
+		"status":           t.Status,
+		"scopes":           scopes,
+		"rate_limit_rps":   t.RateLimitRPS,
+		"rate_limit_burst": t.RateLimitBurst,
+		"created_at":       t.CreatedAt,
+		"updated_at":       t.UpdatedAt,
+	}
+}
+
+// serializeAPIKey makes a JSON view of an APIKeyRow. The key hash is never returned.
+func serializeAPIKey(k *APIKeyRow) map[string]any {
+	scopes := make([]string, 0, len(k.Scopes))
+	for _, s := range k.Scopes {
+		scopes = append(scopes, string(s))
+	}
+	out := map[string]any{
+		"id":               k.ID,
+		"tenant_id":        k.TenantID,
+		"name":             k.Name,
+		"scopes":           scopes,
+		"rate_limit_rps":   k.RateLimitRPS,
+		"rate_limit_burst": k.RateLimitBurst,
+		"status":           k.Status,
+		"created_by":       k.CreatedBy,
+		"created_at":       k.CreatedAt,
+	}
+	if k.RevokedAt.Valid {
+		out["revoked_at"] = k.RevokedAt.Time
+	}
+	return out
+}
+
+const adminAuditEntityTypeTenant = "tenant"
+const adminAuditEntityTypeAPIKey = "api_key"
+
+// defaultTenantScopes is what a tenant gets when no scopes are supplied.
+var defaultTenantScopes = []string{string(domain.ScopeTransfer), string(domain.ScopeWalletRead), string(domain.ScopeWalletWrite)}
+
+func parseScopesParam(raw []string, fallback []string) []domain.TenantScope {
+	if len(raw) == 0 {
+		raw = fallback
+	}
+	return domain.ParseScopes(raw)
+}
+
+// requireAdmin returns true when the request is allowed to use the admin API.
+// When a RequestContext exists (store-based auth) the admin scope is enforced;
+// when the legacy shared env key authenticated the request, access is granted so
+// the admin API can bootstrap its very first tenant+admin key.
+func requireAdmin(r *http.Request) bool {
+	rc, ok := RequestContextFromContext(r.Context())
+	if !ok {
+		// Legacy / bootstrap mode.
+		return true
+	}
+	for _, s := range rc.Scopes {
+		if s == domain.ScopeAdmin {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) CreateTenant(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	var req struct {
+		ID             string   `json:"id"`
+		Name           string   `json:"name"`
+		Scopes         []string `json:"scopes"`
+		RateLimitRPS   float64  `json:"rate_limit_rps"`
+		RateLimitBurst int      `json:"rate_limit_burst"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+		return
+	}
+	// Explicit-ID duplicate check (DB PK violations don't map to os.ErrExist).
+	if req.ID != "" {
+		if _, err := h.authStore.Tenant(r.Context(), req.ID); err == nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "tenant already exists"})
+			return
+		}
+	}
+
+	tenant, err := h.authStore.CreateTenant(r.Context(), CreateTenantRequest{
+		ID:             req.ID,
+		Name:           req.Name,
+		Status:         string(domain.TenantStatusActive),
+		Scopes:         parseScopesParam(req.Scopes, defaultTenantScopes),
+		RateLimitRPS:   req.RateLimitRPS,
+		RateLimitBurst: req.RateLimitBurst,
+	})
+	if err == os.ErrExist {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "tenant already exists"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	_ = h.authStore.CreateAuditNote(r.Context(), CreateAuditNoteRequest{
+		EntityType: adminAuditEntityTypeTenant,
+		EntityID:   tenant.ID,
+		Actor:      adminActor(r),
+		Action:     "tenant.created",
+		Note:       "tenant created via admin API",
+	})
+
+	writeJSON(w, http.StatusCreated, serializeTenant(tenant))
+}
+
+// adminActor identifies the caller for audit notes.
+func adminActor(r *http.Request) string {
+	if rc, ok := RequestContextFromContext(r.Context()); ok {
+		return "apikey:" + rc.APIKeyID
+	}
+	return "legacy-shared-key"
+}
+
+func (h *Handler) ListTenants(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	tenants, err := h.authStore.ListTenants(r.Context(), domain.TenantStatus(r.URL.Query().Get("status")))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if tenants == nil {
+		tenants = []*TenantRow{}
+	}
+	out := make([]map[string]any, 0, len(tenants))
+	for _, t := range tenants {
+		out = append(out, serializeTenant(t))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) GetTenant(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	tenant, err := h.authStore.Tenant(r.Context(), r.PathValue("id"))
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tenant not found"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, serializeTenant(tenant))
+}
+
+// CreateAPIKey issues a new key for a tenant. The raw secret is returned exactly
+// once; only its hash is stored.
+func (h *Handler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	var req struct {
+		ID             string   `json:"id"`
+		TenantID       string   `json:"tenant_id"`
+		Name           string   `json:"name"`
+		Scopes         []string `json:"scopes"`
+		RateLimitRPS   float64  `json:"rate_limit_rps"`
+		RateLimitBurst int      `json:"rate_limit_burst"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
+		return
+	}
+	tenantID := req.TenantID
+	if tenantID == "" {
+		tenantID = r.PathValue("id")
+	}
+	if tenantID == "" || req.Name == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("tenant_id and name are required"))
+		return
+	}
+
+	// Ensure tenant exists first.
+	if _, err := h.authStore.Tenant(r.Context(), tenantID); err != nil {
+		if err == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "tenant not found"})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	rawKey, err := GenerateRawAPIKey()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	key, err := h.authStore.CreateAPIKey(r.Context(), rawKey, CreateAPIKeyRequest{
+		ID:             req.ID,
+		TenantID:       tenantID,
+		Name:           req.Name,
+		Scopes:         parseScopesParam(req.Scopes, defaultTenantScopes),
+		RateLimitRPS:   req.RateLimitRPS,
+		RateLimitBurst: req.RateLimitBurst,
+		Status:         string(domain.APIKeyActive),
+		CreatedBy:      adminActor(r),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	_ = h.authStore.CreateAuditNote(r.Context(), CreateAuditNoteRequest{
+		EntityType: adminAuditEntityTypeAPIKey,
+		EntityID:   key.ID,
+		Actor:      adminActor(r),
+		Action:     "api_key.created",
+		Note:       "key issued via admin API for tenant " + tenantID,
+	})
+
+	resp := serializeAPIKey(key)
+	resp["raw_key"] = rawKey // shown once, never recoverable later
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (h *Handler) ListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	keys, err := h.authStore.ListAPIKeys(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if keys == nil {
+		keys = []*APIKeyRow{}
+	}
+	out := make([]map[string]any, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, serializeAPIKey(k))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (h *Handler) RevokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient scope"})
+		return
+	}
+	keyID := r.PathValue("keyId")
+
+	if err := h.authStore.RevokeAPIKey(r.Context(), keyID, adminActor(r)); err != nil {
+		if err == os.ErrExist {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found or already revoked"})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	_ = h.authStore.CreateAuditNote(r.Context(), CreateAuditNoteRequest{
+		EntityType: adminAuditEntityTypeAPIKey,
+		EntityID:   keyID,
+		Actor:      adminActor(r),
+		Action:     "api_key.revoked",
+		Note:       "key revoked via admin API",
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "id": keyID})
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {

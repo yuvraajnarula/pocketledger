@@ -32,14 +32,15 @@ func (r *LedgerRepo) InsertEntries(ctx context.Context, tx *sql.Tx, entries []do
 }
 
 func (r *LedgerRepo) GetUnreconciledDeposits(ctx context.Context) ([]UnreconciledEntry, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT le.wallet_id, le.amount, le.reference_id, le.created_at
-		FROM ledger_entries le
-		WHERE le.entry_type = 'CREDIT'
-		  AND le.reconciled = false
-		ORDER BY le.created_at ASC
-		LIMIT 50
-	`)
+	rows, err := r.db.QueryContext(ctx,
+		queryForDriver(r.db, `
+		SELECT wallet_id, amount, reference_id, created_at, COALESCE(reconcile_attempts, 0)
+		FROM ledger_entries
+		WHERE entry_type = 'CREDIT'
+		  AND reconciled = false
+		  AND COALESCE(reconcile_attempts, 0) < ?
+		ORDER BY created_at ASC
+		LIMIT 50`), maxReconcileAttempts)
 	if err != nil {
 		return nil, err
 	}
@@ -48,12 +49,22 @@ func (r *LedgerRepo) GetUnreconciledDeposits(ctx context.Context) ([]Unreconcile
 	var entries []UnreconciledEntry
 	for rows.Next() {
 		var e UnreconciledEntry
-		if err := rows.Scan(&e.WalletID, &e.Amount, &e.ReferenceID, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.WalletID, &e.Amount, &e.ReferenceID, &e.CreatedAt, &e.Attempts); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
+}
+
+// IncReconcileAttempts bumps the retry counter for a deposit that failed again.
+func (r *LedgerRepo) IncReconcileAttempts(ctx context.Context, refID string) error {
+	_, err := r.db.ExecContext(ctx,
+		queryForDriver(r.db, `
+		UPDATE ledger_entries
+		SET reconcile_attempts = COALESCE(reconcile_attempts, 0) + 1
+		WHERE reference_id = ?`), refID)
+	return err
 }
 
 // MarkReconciled sets reconciled=true for all entries with the given reference_id.
@@ -76,10 +87,12 @@ func (r *LedgerRepo) MarkUnreconciled(ctx context.Context, refID string) error {
 	return err
 }
 
-// UnreconciledEntry is a deposit that needs retrying.
+// UnreconciledEntry is a deposit that needs retrying. Attempts counts how many
+// reconciler passes have already failed for it (dead-letter cap input).
 type UnreconciledEntry struct {
 	WalletID    string
 	Amount      int64
 	ReferenceID string
 	CreatedAt   time.Time
+	Attempts    int
 }

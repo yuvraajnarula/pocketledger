@@ -35,6 +35,42 @@ func (s *AdvancedService) QueueWebhook(ctx context.Context, eventType, payloadJS
 	return err
 }
 
+// WebhookDelivery is one row of webhook delivery history.
+type WebhookDelivery struct {
+	ID        string `json:"id"`
+	EventType string `json:"event_type"`
+	Payload   string `json:"payload"`
+	Status    string `json:"status"`
+	Attempts  int    `json:"attempts"`
+	Error     string `json:"error,omitempty"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// ListWebhookDeliveries returns recent webhook queue rows (delivery history).
+func (s *AdvancedService) ListWebhookDeliveries(ctx context.Context, limit int) ([]WebhookDelivery, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := queryForDriver(s.db, `SELECT id, event_type, payload, COALESCE(status, ''), COALESCE(attempts, 0), COALESCE(error, ''), COALESCE(created_at, ''), COALESCE(updated_at, '')
+		FROM webhook_queue ORDER BY created_at DESC LIMIT ?`)
+	rows, err := s.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []WebhookDelivery
+	for rows.Next() {
+		var d WebhookDelivery
+		if err := rows.Scan(&d.ID, &d.EventType, &d.Payload, &d.Status, &d.Attempts, &d.Error, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 func (s *AdvancedService) CreateDispute(ctx context.Context, refID, walletID string, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -64,6 +64,116 @@ func (s *TransferService) Execute(ctx context.Context, srcID, destID string, amo
 	return s.executeLocal(ctx, srcID, destID, amount, refID)
 }
 
+// ExecuteFX performs a cross-currency transfer entirely within the ledger DB.
+// The source wallet is debited `amount` and the destination wallet is credited
+// the FX-converted amount, so the ledger stays balanced by construction.
+// Returns (srcAmount, dstAmount).
+func (s *TransferService) ExecuteFX(ctx context.Context, srcID, destID string, amount int64, refID string) (int64, int64, error) {
+	if amount <= 0 {
+		return 0, 0, domain.ErrInvalidAmount
+	}
+	if srcID == destID {
+		return 0, 0, fmt.Errorf("source and destination wallets must differ")
+	}
+	if srcID == bankWalletID {
+		return 0, 0, fmt.Errorf("bank wallet transfers must use the plain transfer endpoint")
+	}
+
+	fx := NewAdvancedService(s.DB)
+
+	tx, err := s.DB.BeginTx(ctx, writeTxOpts)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+
+	var srcBal, srcVersion int64
+	var srcCur string
+	query := queryForDriver(s.DB, "SELECT balance, version, currency FROM wallets WHERE id = ?")
+	err = tx.QueryRowContext(ctx, query, srcID).Scan(&srcBal, &srcVersion, &srcCur)
+	if err == sql.ErrNoRows {
+		return 0, 0, domain.ErrWalletNotFound
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if srcBal < amount {
+		return 0, 0, domain.ErrInsufficientFunds
+	}
+
+	var dstVersion int64
+	var dstCur string
+	query = queryForDriver(s.DB, "SELECT version, currency FROM wallets WHERE id = ?")
+	err = tx.QueryRowContext(ctx, query, destID).Scan(&dstVersion, &dstCur)
+	if err == sql.ErrNoRows {
+		return 0, 0, domain.ErrWalletNotFound
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Resolve the FX rate now that both currencies are known. Read-only query,
+	// safe to run against the DB handle inside the write tx.
+	dstAmount, err := fx.ConvertAmount(ctx, srcCur, dstCur, amount)
+	if err != nil {
+		return 0, 0, err
+	}
+	if dstAmount <= 0 {
+		return 0, 0, domain.ErrInvalidAmount
+	}
+
+	if err := ValidateDailyWithdrawal(ctx, s.DB, srcID, amount); err != nil {
+		return 0, 0, err
+	}
+
+	query = queryForDriver(s.DB, "UPDATE wallets SET balance = balance - ?, version = version + 1, updated_at = "+currentTimestampExpr(s.DB)+" WHERE id = ? AND version = ?")
+	res, err := tx.ExecContext(ctx, query, amount, srcID, srcVersion)
+	if err != nil {
+		return 0, 0, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return 0, 0, domain.ErrOptimisticLockFail
+	}
+
+	query = queryForDriver(s.DB, "UPDATE wallets SET balance = balance + ?, version = version + 1, updated_at = "+currentTimestampExpr(s.DB)+" WHERE id = ? AND version = ?")
+	res, err = tx.ExecContext(ctx, query, dstAmount, destID, dstVersion)
+	if err != nil {
+		return 0, 0, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return 0, 0, domain.ErrOptimisticLockFail
+	}
+
+	if refID == "" {
+		refID = fmt.Sprintf("auto:fx:%s:%s:%d", srcID, destID, amount)
+	}
+
+	entries := []domain.LedgerEntry{
+		{WalletID: srcID, EntryType: "DEBIT", Amount: amount, ReferenceID: refID},
+		{WalletID: destID, EntryType: "CREDIT", Amount: dstAmount, ReferenceID: refID},
+	}
+	if err := s.LedgerRepo.InsertEntries(ctx, tx, entries); err != nil {
+		return 0, 0, err
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"from": srcID, "to": destID, "amount": amount, "dest_amount": dstAmount,
+		"reference_id": refID, "currencies": []string{srcCur, dstCur},
+	})
+	if err := s.eventRepo.Append(ctx, tx, domain.Event{
+		AggregateID: srcID,
+		EventType:   "wallet.transfer.fx",
+		Payload:     string(payload),
+	}); err != nil {
+		return 0, 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return amount, dstAmount, nil
+}
+
 func (s *TransferService) executeBankDeposit(ctx context.Context, srcID, destID string, amount int64, refID string) error {
 	tx, err := s.DB.BeginTx(ctx, writeTxOpts)
 	if err != nil {
@@ -161,8 +271,12 @@ func (s *TransferService) executeWithClient(ctx context.Context, srcID, destID s
 	if src.Balance < amount {
 		return domain.ErrInsufficientFunds
 	}
-	if _, err := s.WalletClient.GetWallet(ctx, destID); err != nil {
+	dest, err := s.WalletClient.GetWallet(ctx, destID)
+	if err != nil {
 		return err
+	}
+	if dest.Currency != src.Currency {
+		return domain.ErrCurrencyMismatch
 	}
 
 	if err := ValidateDailyWithdrawal(ctx, s.DB, srcID, amount); err != nil {
@@ -197,8 +311,9 @@ func (s *TransferService) executeLocal(ctx context.Context, srcID, destID string
 	defer tx.Rollback()
 
 	var srcBal, srcVersion int64
-	query := queryForDriver(s.DB, "SELECT balance, version FROM wallets WHERE id = ?")
-	err = tx.QueryRowContext(ctx, query, srcID).Scan(&srcBal, &srcVersion)
+	var srcCur string
+	query := queryForDriver(s.DB, "SELECT balance, version, currency FROM wallets WHERE id = ?")
+	err = tx.QueryRowContext(ctx, query, srcID).Scan(&srcBal, &srcVersion, &srcCur)
 	if err == sql.ErrNoRows {
 		return domain.ErrWalletNotFound
 	}
@@ -210,13 +325,17 @@ func (s *TransferService) executeLocal(ctx context.Context, srcID, destID string
 	}
 
 	var destVersion int64
-	query = queryForDriver(s.DB, "SELECT version FROM wallets WHERE id = ?")
-	err = tx.QueryRowContext(ctx, query, destID).Scan(&destVersion)
+	var destCur string
+	query = queryForDriver(s.DB, "SELECT version, currency FROM wallets WHERE id = ?")
+	err = tx.QueryRowContext(ctx, query, destID).Scan(&destVersion, &destCur)
 	if err == sql.ErrNoRows {
 		return domain.ErrWalletNotFound
 	}
 	if err != nil {
 		return err
+	}
+	if destCur != srcCur {
+		return domain.ErrCurrencyMismatch
 	}
 
 	if err := ValidateDailyWithdrawal(ctx, s.DB, srcID, amount); err != nil {
@@ -267,6 +386,13 @@ func (s *TransferService) recordLedger(ctx context.Context, tx *sql.Tx, srcID, d
 	entries, err := domain.ComputeTransfer(srcID, destID, srcBal, amount)
 	if err != nil {
 		return err
+	}
+	// Tag entries with the reference so /admin/dispute and MarkReconciled can
+	// look them up later (ComputeTransfer doesn't know the ref).
+	for i := range entries {
+		if entries[i].ReferenceID == "" {
+			entries[i].ReferenceID = refID
+		}
 	}
 	if len(entries) == 0 {
 		return fmt.Errorf("recordLedger: ComputeTransfer returned no entries for src=%s dest=%s", srcID, destID)

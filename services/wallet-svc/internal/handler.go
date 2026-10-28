@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ func (h *Handler) SetMetrics(m *Metrics) {
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /wallets", h.CreateWallet)
+	mux.HandleFunc("GET /wallets", h.ListWallets)
 	mux.HandleFunc("GET /wallets/{id}", h.GetWallet)
 	mux.HandleFunc("POST /wallets/{id}/deposit", h.Deposit) // proxy to ledger-svc
 	mux.HandleFunc("POST /wallets/{id}/withdraw", h.Withdraw)
@@ -101,6 +103,25 @@ func (h *Handler) CreateWallet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, wallet)
+}
+
+// ---------- ListWallets ----------
+func (h *Handler) ListWallets(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+
+	wr := NewWalletRepo(h.db)
+	wallets, err := wr.List(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if wallets == nil {
+		wallets = []*domain.Wallet{}
+	}
+	writeJSON(w, http.StatusOK, wallets)
 }
 
 // ---------- GetWallet ----------
