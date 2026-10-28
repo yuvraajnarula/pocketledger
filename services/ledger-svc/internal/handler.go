@@ -23,7 +23,7 @@ type Handler struct {
 	transferSvc *TransferService
 	advancedSvc *AdvancedService
 	proofEngine *ProofEngine
-	chaosConfig *ChaosConfig
+	chaos       *ChaosController // replaces the old *ChaosConfig field
 	rateLimiter RateLimiter
 }
 
@@ -31,7 +31,9 @@ func (h *Handler) WalletClient() *walletsvc.Client {
 	return h.transferSvc.WalletClient
 }
 
-func NewHandler(db *sql.DB, rl RateLimiter) *Handler {
+// NewHandler now accepts a pre-built *ChaosController so main.go owns the
+// single instance that is also passed to ChaosMiddleware.
+func NewHandler(db *sql.DB, rl RateLimiter, chaos *ChaosController) *Handler {
 	wr := NewWalletRepo(db)
 	lr := NewLedgerRepo(db)
 	er := NewEventRepo(db)
@@ -53,11 +55,10 @@ func NewHandler(db *sql.DB, rl RateLimiter) *Handler {
 		transferSvc: ts,
 		advancedSvc: NewAdvancedService(db),
 		proofEngine: NewProofEngine(os.Getenv("PROOF_SECRET_KEY")),
-		chaosConfig: NewChaosConfig(),
+		chaos:       chaos,
 		rateLimiter: rl,
 	}
 
-	// FIXED: correct LoadPolicy usage (2 return values)
 	if policyPath := os.Getenv("POLICY_CONFIG_PATH"); policyPath != "" {
 		if _, err := LoadPolicy(policyPath); err != nil {
 			fmt.Printf("warning: failed to load policy config: %v\n", err)
@@ -84,16 +85,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /reconcile", h.Reconcile)
 	mux.HandleFunc("GET /wallets/{id}/balance-at", h.GetBalanceAtTime)
 	mux.HandleFunc("GET /idempotency/keys", h.ListIdempotencyKeys)
-	mux.HandleFunc("POST /admin/chaos", h.ToggleChaos)
-
+	if os.Getenv("CHAOS_ENABLED") == "true" {
+		mux.HandleFunc("POST /admin/chaos", h.ToggleChaos)
+	}
 	mux.HandleFunc("GET /fx/rates", h.GetFXRates)
-
 	mux.HandleFunc("POST /wallets/{src}/transfer/fx", h.TransferWithFX)
 	mux.HandleFunc("GET /webhooks/deliveries", h.ListWebhooks)
 	mux.HandleFunc("POST /admin/dispute", h.CreateDispute)
-
 	mux.HandleFunc("GET /wallets/{id}/proof", h.GetBalanceProof)
-
 	mux.HandleFunc("GET /admin/postmortem", h.GeneratePostMortem)
 	mux.HandleFunc("POST /admin/postmortem", h.GeneratePostMortem)
 
@@ -220,12 +219,28 @@ func (h *Handler) ListIdempotencyKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ToggleChaos(w http.ResponseWriter, r *http.Request) {
-	var req struct{ Enabled bool }
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
+		return
+	}
 
-	h.chaosConfig.Toggle(req.Enabled)
+	if req.Enabled {
+		h.chaos.Enable()
+	} else {
+		h.chaos.Disable()
+	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"chaos": req.Enabled})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": h.chaos.IsEnabled(),
+		"config": map[string]any{
+			"failure_probability": h.chaos.cfg.FailureProbability,
+			"min_latency_ms":      h.chaos.cfg.MinLatencyMs,
+			"max_latency_ms":      h.chaos.cfg.MaxLatencyMs,
+		},
+	})
 }
 
 /* ---------------- REQUIRED METHOD ---------------- */
@@ -241,13 +256,10 @@ func (h *Handler) GetFXRates(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	var out []any
-
 	for rows.Next() {
 		var b, t string
 		var rate float64
-
 		_ = rows.Scan(&b, &t, &rate)
-
 		out = append(out, map[string]any{
 			"base":   b,
 			"target": t,
@@ -281,6 +293,10 @@ func (h *Handler) GeneratePostMortem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	if err := h.db.PingContext(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unhealthy", "error": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
 }
 
